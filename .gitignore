@@ -1,0 +1,7 @@
+# Node dependencies and runtime output
+backend/node_modules/
+backend/.npm-cache/
+backend/backend-startup.log
+
+# Local environment secrets
+.env

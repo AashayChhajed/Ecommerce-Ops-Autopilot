@@ -1,0 +1,130 @@
+{
+  "_meta": {
+    "description": "Committed evaluation dataset — Day 2 low-stock test cases for WeSee Frontier Trial automated scoring.",
+    "version": "1.0.0",
+    "committed_at": "2026-07-28",
+    "acceptance_criteria": "Inventory monitor must flag ALL 10 cases where inventory <= threshold. Zero false negatives."
+  },
+  "test_cases": [
+    {
+      "case_id": "INV-001",
+      "product_title": "Premium Cotton T-Shirt",
+      "shopify_product_id": 9001,
+      "current_inventory": 0,
+      "threshold": 5,
+      "expected_alert": true,
+      "alert_severity": "CRITICAL",
+      "description": "Completely out of stock — must trigger immediate alert"
+    },
+    {
+      "case_id": "INV-002",
+      "product_title": "Leather Wallet",
+      "shopify_product_id": 9002,
+      "current_inventory": 1,
+      "threshold": 5,
+      "expected_alert": true,
+      "alert_severity": "HIGH",
+      "description": "Single unit remaining — must trigger alert"
+    },
+    {
+      "case_id": "INV-003",
+      "product_title": "Wireless Earbuds",
+      "shopify_product_id": 9003,
+      "current_inventory": 3,
+      "threshold": 5,
+      "expected_alert": true,
+      "alert_severity": "HIGH",
+      "description": "3 units — below threshold of 5"
+    },
+    {
+      "case_id": "INV-004",
+      "product_title": "Running Shoes",
+      "shopify_product_id": 9004,
+      "current_inventory": 5,
+      "threshold": 5,
+      "expected_alert": true,
+      "alert_severity": "MEDIUM",
+      "description": "Exactly at threshold — boundary case, must trigger"
+    },
+    {
+      "case_id": "INV-005",
+      "product_title": "Yoga Mat",
+      "shopify_product_id": 9005,
+      "current_inventory": 2,
+      "threshold": 10,
+      "expected_alert": true,
+      "alert_severity": "HIGH",
+      "description": "Custom threshold of 10 — 2 units triggers alert"
+    },
+    {
+      "case_id": "INV-006",
+      "product_title": "Blue Denim Jacket",
+      "shopify_product_id": 9006,
+      "current_inventory": 4,
+      "threshold": 5,
+      "expected_alert": true,
+      "alert_severity": "HIGH",
+      "description": "4 units — under standard threshold of 5"
+    },
+    {
+      "case_id": "INV-007",
+      "product_title": "Coffee Grinder",
+      "shopify_product_id": 9007,
+      "current_inventory": 0,
+      "threshold": 3,
+      "expected_alert": true,
+      "alert_severity": "CRITICAL",
+      "description": "Out of stock with custom threshold of 3"
+    },
+    {
+      "case_id": "INV-008",
+      "product_title": "Stainless Steel Water Bottle",
+      "shopify_product_id": 9008,
+      "current_inventory": 2,
+      "threshold": 5,
+      "expected_alert": true,
+      "alert_severity": "HIGH",
+      "description": "2 units — under threshold"
+    },
+    {
+      "case_id": "INV-009",
+      "product_title": "Backpack Pro",
+      "shopify_product_id": 9009,
+      "current_inventory": 1,
+      "threshold": 5,
+      "expected_alert": true,
+      "alert_severity": "HIGH",
+      "description": "1 unit remaining — critical low stock"
+    },
+    {
+      "case_id": "INV-010",
+      "product_title": "Smart Watch Band",
+      "shopify_product_id": 9010,
+      "current_inventory": 3,
+      "threshold": 5,
+      "expected_alert": true,
+      "alert_severity": "MEDIUM",
+      "description": "3 units — 40% below threshold"
+    }
+  ],
+  "negative_cases": [
+    {
+      "case_id": "INV-NEG-001",
+      "product_title": "Standard Tote Bag",
+      "shopify_product_id": 9011,
+      "current_inventory": 6,
+      "threshold": 5,
+      "expected_alert": false,
+      "description": "One unit above threshold — must NOT trigger alert"
+    },
+    {
+      "case_id": "INV-NEG-002",
+      "product_title": "Desk Lamp",
+      "shopify_product_id": 9012,
+      "current_inventory": 50,
+      "threshold": 5,
+      "expected_alert": false,
+      "description": "Healthy stock — must NOT trigger alert"
+    }
+  ]
+}

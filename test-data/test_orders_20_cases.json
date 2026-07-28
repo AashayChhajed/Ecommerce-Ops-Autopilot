@@ -1,0 +1,30 @@
+{
+  "_meta": {
+    "description": "Committed evaluation dataset — Day 2 order notification test cases for WeSee Frontier Trial automated scoring.",
+    "version": "1.0.0",
+    "committed_at": "2026-07-28",
+    "acceptance_criteria": "Notification engine must successfully send emails for ALL 20 orders. Zero misses allowed."
+  },
+  "test_orders": [
+    { "case_id": "ORD-001", "shopify_order_id": 5001, "customer_name": "Alice Johnson", "email": "alice.j@example.com", "status": "paid", "total": 89.99, "expected_notification": true },
+    { "case_id": "ORD-002", "shopify_order_id": 5002, "customer_name": "Bob Smith", "email": "bob.smith@example.com", "status": "paid", "total": 124.50, "expected_notification": true },
+    { "case_id": "ORD-003", "shopify_order_id": 5003, "customer_name": "Carol Williams", "email": "carol.w@example.com", "status": "paid", "total": 45.00, "expected_notification": true },
+    { "case_id": "ORD-004", "shopify_order_id": 5004, "customer_name": "David Brown", "email": "d.brown@example.com", "status": "paid", "total": 299.99, "expected_notification": true },
+    { "case_id": "ORD-005", "shopify_order_id": 5005, "customer_name": "Emma Davis", "email": "emma.d@example.com", "status": "paid", "total": 67.25, "expected_notification": true },
+    { "case_id": "ORD-006", "shopify_order_id": 5006, "customer_name": "Frank Miller", "email": "frank.m@example.com", "status": "paid", "total": 189.00, "expected_notification": true },
+    { "case_id": "ORD-007", "shopify_order_id": 5007, "customer_name": "Grace Wilson", "email": "grace.w@example.com", "status": "paid", "total": 55.75, "expected_notification": true },
+    { "case_id": "ORD-008", "shopify_order_id": 5008, "customer_name": "Henry Moore", "email": "h.moore@example.com", "status": "paid", "total": 412.00, "expected_notification": true },
+    { "case_id": "ORD-009", "shopify_order_id": 5009, "customer_name": "Iris Taylor", "email": "iris.t@example.com", "status": "paid", "total": 33.50, "expected_notification": true },
+    { "case_id": "ORD-010", "shopify_order_id": 5010, "customer_name": "James Anderson", "email": "james.a@example.com", "status": "paid", "total": 149.99, "expected_notification": true },
+    { "case_id": "ORD-011", "shopify_order_id": 5011, "customer_name": "Karen Thomas", "email": "karen.t@example.com", "status": "paid", "total": 78.00, "expected_notification": true },
+    { "case_id": "ORD-012", "shopify_order_id": 5012, "customer_name": "Leo Jackson", "email": "leo.j@example.com", "status": "pending", "total": 220.50, "expected_notification": true },
+    { "case_id": "ORD-013", "shopify_order_id": 5013, "customer_name": "Mia White", "email": "mia.w@example.com", "status": "paid", "total": 95.00, "expected_notification": true },
+    { "case_id": "ORD-014", "shopify_order_id": 5014, "customer_name": "Nathan Harris", "email": "n.harris@example.com", "status": "paid", "total": 340.00, "expected_notification": true },
+    { "case_id": "ORD-015", "shopify_order_id": 5015, "customer_name": "Olivia Martin", "email": "olivia.m@example.com", "status": "paid", "total": 62.25, "expected_notification": true },
+    { "case_id": "ORD-016", "shopify_order_id": 5016, "customer_name": "Paul Garcia", "email": "paul.g@example.com", "status": "paid", "total": 175.99, "expected_notification": true },
+    { "case_id": "ORD-017", "shopify_order_id": 5017, "customer_name": "Quinn Martinez", "email": "quinn.m@example.com", "status": "paid", "total": 88.00, "expected_notification": true },
+    { "case_id": "ORD-018", "shopify_order_id": 5018, "customer_name": "Rachel Robinson", "email": "rachel.r@example.com", "status": "paid", "total": 510.00, "expected_notification": true },
+    { "case_id": "ORD-019", "shopify_order_id": 5019, "customer_name": "Samuel Clark", "email": "sam.c@example.com", "status": "paid", "total": 42.75, "expected_notification": true },
+    { "case_id": "ORD-020", "shopify_order_id": 5020, "customer_name": "Tina Lewis", "email": "tina.l@example.com", "status": "paid", "total": 199.00, "expected_notification": true }
+  ]
+}
