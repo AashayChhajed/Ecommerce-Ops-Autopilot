@@ -1,10 +1,24 @@
-import 'dotenv/config';
+import 'dotenv/config'; // ESM side-effect import — runs BEFORE other app modules (critical for PG vars)
+
+import { fileURLToPath } from 'url';
+import { dirname, resolve } from 'path';
+import dotenv from 'dotenv';
+
+// Also load .env from project root (relative to this file: backend/src/server.js)
+const __dirname = dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: resolve(__dirname, '..', '..', '.env') });
+// Fallback: load from cwd's .env (for backward compat / alternative setups)
+dotenv.config();
+
 import http from 'node:http';
 import { initializeDatabase, query, closeDatabase } from './database.js';
 import {
   productFromShopify, shopifyBaseUrl, toApiProduct,
   orderFromShopify, toApiOrder, toApiInventoryAlert,
   toApiActivityLog, toApiSchedulerRun, toApiDescription,
+  logActivity, auditInventory,
+  generateSingleDescription, generateMissingDescriptions,
+  sendOrderNotifications,
 } from './lib.js';
 import { startScheduler } from './scheduler.js';
 
@@ -37,20 +51,6 @@ function parseBody(req) {
 }
 
 // ──────────────────────────────────────────────
-// Utility: structured activity logger
-// ──────────────────────────────────────────────
-export async function logActivity(type, message, status = 'INFO') {
-  try {
-    await query(
-      `INSERT INTO activity_logs (type, message, status) VALUES ($1, $2, $3)`,
-      [type, message, status]
-    );
-  } catch (err) {
-    console.error('[ActivityLog] Failed to write log:', err.message);
-  }
-}
-
-// ──────────────────────────────────────────────
 // Shopify fetcher with retry
 // ──────────────────────────────────────────────
 async function shopifyFetch(path) {
@@ -74,7 +74,8 @@ async function shopifyFetch(path) {
 // Core sync functions (exported for scheduler)
 // ──────────────────────────────────────────────
 export async function syncProducts() {
-  const data = await shopifyFetch('/products.json?limit=250&status=active');
+  const limit = Number(process.env.SHOPIFY_PRODUCT_LIMIT) || 250; // Shopify max is 250
+  const data = await shopifyFetch(`/products.json?limit=${limit}&status=active`);
   const rawProducts = data.products ?? [];
   const products = rawProducts.map(productFromShopify);
   const shopifyIds = products.map((p) => p.shopifyProductId);
@@ -144,32 +145,6 @@ export async function syncOrders() {
 
   await logActivity('ORDER_SYNC', `Synchronized ${orders.length} order(s) from Shopify.`, 'SUCCESS');
   return { ordersSynced: orders.length };
-}
-
-export async function auditInventory() {
-  const { rows: lowStock } = await query(
-    `SELECT id, title, inventory FROM products WHERE inventory <= 5 AND inventory >= 0`
-  );
-  let alertsCreated = 0;
-  for (const product of lowStock) {
-    const { rows: existing } = await query(
-      'SELECT id FROM inventory_alerts WHERE product_id = $1 AND resolved = FALSE',
-      [product.id]
-    );
-    if (existing.length === 0) {
-      await query(
-        'INSERT INTO inventory_alerts (product_id, current_stock, threshold) VALUES ($1, $2, 5)',
-        [product.id, product.inventory]
-      );
-      alertsCreated += 1;
-      await logActivity(
-        'LOW_STOCK_ALERT',
-        `Low stock: "${product.title}" — ${product.inventory} remaining (threshold: 5).`,
-        'WARNING'
-      );
-    }
-  }
-  return { alertsCreated, lowStockCount: lowStock.length };
 }
 
 export async function fullSync() {
@@ -336,6 +311,11 @@ const server = http.createServer(async (req, res) => {
         : send(res, 404, { message: 'Alert not found' });
     }
 
+    // ── Order Notifications ─────────────────────
+    if (method === 'POST' && path === '/api/orders/notify') {
+      return send(res, 200, await sendOrderNotifications());
+    }
+
     // ── Shopify Sync ────────────────────────────
     if (method === 'POST' && path === '/api/shopify/sync') {
       return send(res, 200, await fullSync());
@@ -352,51 +332,46 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, rows.map(toApiDescription));
     }
 
+    // Batch generation (must come before the :id route)
+    if (method === 'POST' && path === '/api/descriptions/generate/batch') {
+      const result = await generateMissingDescriptions();
+      return send(res, 200, result);
+    }
+
+    // ── AI Description Generation (two URL patterns) ──
+    // Primary: /api/products/:id/generate-description
+    const productGenMatch = path.match(/^\/api\/products\/(\d+)\/generate-description$/);
+    // Backward-compatible alias: /api/descriptions/generate/:id
     const descGenerateMatch = path.match(/^\/api\/descriptions\/generate\/(\d+)$/);
-    if (method === 'POST' && descGenerateMatch) {
-      const productId = descGenerateMatch[1];
+
+    const genMatch = productGenMatch || descGenerateMatch;
+    if (method === 'POST' && genMatch) {
+      const productId = genMatch[1];
       const { rows: productRows } = await query('SELECT * FROM products WHERE id = $1', [productId]);
       if (!productRows.length) return send(res, 404, { message: 'Product not found' });
-      const product = productRows[0];
 
-      // Check Gemini API key
-      const geminiKey = process.env.GEMINI_API_KEY;
-      if (!geminiKey || geminiKey.startsWith('placeholder')) {
-        // Mock description for development
-        const mockDesc = `Introducing ${product.title} — a premium product from ${product.vendor || 'our collection'}. Crafted with attention to detail, this item delivers exceptional quality and performance that discerning customers demand. Whether for personal use or as a thoughtful gift, it stands out from the rest.\n\nKey highlights:\n• Superior build quality and lasting durability\n• Designed for everyday reliability and ease of use\n• Backed by our commitment to customer satisfaction\n\nAdd ${product.title} to your cart today and experience the difference quality makes. Limited stock available — order now and enjoy fast, reliable shipping.`;
-
-        const { rows } = await query(`
-          INSERT INTO descriptions (product_id, generated_description, approved, generated_at)
-          VALUES ($1, $2, FALSE, NOW())
-          ON CONFLICT DO NOTHING
-          RETURNING *
-        `, [productId, mockDesc]);
-        await logActivity('AI_GENERATION', `Generated description for "${product.title}" (mock mode).`, 'SUCCESS');
-        return send(res, 200, rows.length ? toApiDescription({ ...rows[0], product_title: product.title }) : { message: 'Description already exists' });
+      // Parse optional tone from request body
+      let tone;
+      try {
+        const body = await parseBody(req);
+        tone = body?.tone;
+      } catch {
+        // Body is optional — ignore parse errors
       }
 
-      // Real Gemini call
-      const prompt = `You are an expert e-commerce copywriter. Generate a compelling product description for the following product.\n\nProduct Title: ${product.title}\nVendor/Category: ${product.vendor || 'General'}\n\nRequirements:\n- Target Word Count: 120-150 words\n- Tone: Professional, engaging, benefit-focused\n- Format: Opening hook paragraph, then 3-4 bullet points of key features, then a strong call-to-action\n- Output: PLAIN TEXT ONLY, no markdown headers or HTML tags`;
+      // Normalize: empty string means default (no tone)
+      if (tone === '') tone = undefined;
 
-      const geminiRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-        }
-      );
-      if (!geminiRes.ok) throw new Error(`Gemini API error: ${geminiRes.status}`);
-      const geminiData = await geminiRes.json();
-      const generatedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+      const validTones = ['professional', 'friendly', 'playful', 'expert'];
+      if (tone && !validTones.includes(tone)) {
+        return send(res, 400, {
+          message: `Invalid tone "${tone}". Valid options: ${validTones.join(', ')}`,
+        });
+      }
 
-      const { rows } = await query(`
-        INSERT INTO descriptions (product_id, generated_description, approved, generated_at)
-        VALUES ($1, $2, FALSE, NOW())
-        RETURNING *
-      `, [productId, generatedText]);
-      await logActivity('AI_GENERATION', `Generated AI description for "${product.title}".`, 'SUCCESS');
-      return send(res, 200, toApiDescription({ ...rows[0], product_title: product.title }));
+      const desc = await generateSingleDescription(productRows[0], { tone });
+      if (!desc) return send(res, 200, { message: 'Description already exists' });
+      return send(res, 200, toApiDescription(desc));
     }
 
     const descApproveMatch = path.match(/^\/api\/descriptions\/approve\/(\d+)$/);
@@ -465,7 +440,7 @@ const server = http.createServer(async (req, res) => {
 // ──────────────────────────────────────────────
 async function start() {
   await initializeDatabase();
-  startScheduler({ fullSync, auditInventory, logActivity });
+  startScheduler({ fullSync, auditInventory, sendOrderNotifications, generateMissingDescriptions, logActivity });
   server.listen(port, () => {
     console.log(`\n🚀 E-Commerce Autopilot Backend`);
     console.log(`   Listening: http://localhost:${port}`);
@@ -481,7 +456,10 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-start().catch((error) => {
-  console.error('Failed to start backend:', error);
-  process.exit(1);
-});
+// Only auto-start when run directly (not imported by tests or other modules)
+if (!process.env.AUTOPILOT_SKIP_START) {
+  start().catch((error) => {
+    console.error('Failed to start backend:', error);
+    process.exit(1);
+  });
+}

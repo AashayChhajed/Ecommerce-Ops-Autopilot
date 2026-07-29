@@ -51,7 +51,7 @@ async function runJob(jobName, fn, { logActivity }) {
   }
 }
 
-export function startScheduler({ fullSync, auditInventory, logActivity }) {
+export function startScheduler({ fullSync, auditInventory, sendOrderNotifications, generateMissingDescriptions, logActivity }) {
   console.log('[Scheduler] Starting background job engine...');
 
   // ── Job 1: Full Shopify Sync — every 5 minutes ──────────────────────────
@@ -66,7 +66,18 @@ export function startScheduler({ fullSync, auditInventory, logActivity }) {
     runJob('InventoryAuditJob', () => auditInventory(), { logActivity });
   });
 
-  // ── Job 3: Log Cleanup — daily at 02:00 ─────────────────────────────────
+  // ── Job 3: Order Notifications — every 5 minutes (offset 15s) ───────────
+  cron.schedule('*/5 * * * *', async () => {
+    await new Promise((r) => setTimeout(r, 15_000)); // 15s stagger
+    runJob('OrderNotificationJob', () => sendOrderNotifications(), { logActivity });
+  });
+
+  // ── Job 4: AI Description Generation — every 60 minutes ──────────────────
+  cron.schedule('0 * * * *', () => {
+    runJob('DescriptionGenerationJob', () => generateMissingDescriptions(), { logActivity });
+  });
+
+  // ── Job 5: Log Cleanup — daily at 02:00 ─────────────────────────────────
   cron.schedule('0 2 * * *', () => {
     runJob('LogCleanupJob', async () => {
       const { rowCount } = await query(
@@ -76,5 +87,5 @@ export function startScheduler({ fullSync, auditInventory, logActivity }) {
     }, { logActivity });
   });
 
-  console.log('[Scheduler] ✔ Jobs registered: ShopifySyncJob (*/5m), InventoryAuditJob (*/5m+30s), LogCleanupJob (daily 02:00)');
+  console.log('[Scheduler] ✔ Jobs registered: ShopifySyncJob (*/5m), InventoryAuditJob (*/5m+30s), OrderNotificationJob (*/5m+15s), DescriptionGenerationJob (hourly), LogCleanupJob (daily 02:00)');
 }
