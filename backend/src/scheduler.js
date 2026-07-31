@@ -64,29 +64,29 @@ async function runJob(jobName, fn, { logActivity }) {
 export function startScheduler({ fullSync, auditInventory, sendOrderNotifications, generateMissingDescriptions, reconcileChannelListings, logActivity }) {
   console.log('[Scheduler] Starting background job engine...');
 
-  // ── Job 1: Full Shopify Sync — every 15 minutes ─────────────────────────
-  cron.schedule('*/15 * * * *', () => {
+  // ── Job 1: Full Shopify Sync — every 1 hour ──────────────────────────────
+  cron.schedule('0 * * * *', () => {
     runJob('ShopifySyncJob', () => fullSync(), { logActivity });
   });
 
-  // ── Job 2: Inventory Audit — every 15 minutes (offset 30s) ──────────────
+  // ── Job 2: Inventory Audit — every 1 hour (offset 30s) ───────────────────
   // We stagger by 30s inside the handler to avoid race conditions
-  cron.schedule('*/15 * * * *', async () => {
+  cron.schedule('0 * * * *', async () => {
     await new Promise((r) => setTimeout(r, 30_000)); // 30s stagger
     runJob('InventoryAuditJob', () => auditInventory(), { logActivity });
   });
 
-  // ── Job 3: Order Notifications — every 15 minutes (offset 15s) ──────────
-  cron.schedule('*/15 * * * *', async () => {
+  // ── Job 3: Order Notifications — every 1 hour (offset 15s) ───────────────
+  cron.schedule('0 * * * *', async () => {
     await new Promise((r) => setTimeout(r, 15_000)); // 15s stagger
     runJob('OrderNotificationJob', () => sendOrderNotifications(), { logActivity });
   });
 
-  // ── Job 4: Listing Reconcile — every 15 minutes (offset 45s) ────────────
+  // ── Job 4: Listing Reconcile — every 1 hour (offset 45s) ─────────────────
   // Caps every channel listing to warehouse availability so marketplaces never
   // advertise more than the warehouse can fulfill — the primary anti-penalty
   // safeguard (no order for stock that doesn't exist).
-  cron.schedule('*/15 * * * *', async () => {
+  cron.schedule('0 * * * *', async () => {
     await new Promise((r) => setTimeout(r, 45_000)); // 45s stagger
     runJob('ListingReconcileJob', async () => {
       const result = await reconcileChannelListings();
@@ -113,5 +113,5 @@ export function startScheduler({ fullSync, auditInventory, sendOrderNotification
     }, { logActivity });
   });
 
-  console.log('[Scheduler] ✔ Jobs registered: ShopifySyncJob (*/15m), InventoryAuditJob (*/15m+30s), OrderNotificationJob (*/15m+15s), ListingReconcileJob (*/15m+45s), DescriptionGenerationJob (every 2h), LogCleanupJob (daily 02:00)');
+  console.log('[Scheduler] ✔ Jobs registered: ShopifySyncJob (hourly), InventoryAuditJob (hourly+30s), OrderNotificationJob (hourly+15s), ListingReconcileJob (hourly+45s), DescriptionGenerationJob (every 2h), LogCleanupJob (daily 02:00)');
 }

@@ -216,7 +216,7 @@ export async function auditInventory() {
 export async function getBrandVoiceSettings() {
   const { rows } = await query('SELECT * FROM description_settings ORDER BY id DESC LIMIT 1');
   if (rows.length === 0) {
-    return { id: null, tone: 'professional', language: 'English', brandPhrases: '', styleNotes: '' };
+    return { id: null, tone: '', language: '', brandPhrases: '', styleNotes: '' };
   }
   return toApiDescriptionSettings(rows[0]);
 }
@@ -230,10 +230,10 @@ export async function updateBrandVoiceSettings(settings) {
     VALUES ($1, $2, $3, $4, NOW())
     RETURNING *
   `, [
-    settings.tone || 'professional',
-    settings.language || 'English',
-    settings.brandPhrases || '',
-    settings.styleNotes || '',
+    settings.tone ?? '',
+    settings.language ?? '',
+    settings.brandPhrases ?? '',
+    settings.styleNotes ?? '',
   ]);
 
   await logActivity(

@@ -4,7 +4,7 @@ import React, { useEffect, useState, useCallback } from 'react';
 import {
   Bell, RefreshCcw, AlertTriangle, CheckCircle2, PackageX,
   Warehouse, ShoppingBag, Store, Globe, Layers, Edit3,
-  Save, X, ChevronDown, ChevronUp, RotateCcw, Lock, PackageOpen, ShieldCheck, Search
+  Save, X, ChevronDown, ChevronUp, RotateCcw, Lock, PackageOpen, ShieldCheck, Search, Tag
 } from 'lucide-react';
 import {
   fetchUnifiedInventory, fetchInventoryAlerts,
@@ -297,7 +297,6 @@ export default function MultiChannelInventoryPage() {
                 <TableHead className="text-right text-[10px]"><span className="inline-flex items-center gap-1"><Store className="h-3 w-3" /> Amazon</span></TableHead>
                 <TableHead className="text-right text-[10px]"><span className="inline-flex items-center gap-1"><Globe className="h-3 w-3" /> Myntra</span></TableHead>
                 <TableHead className="text-right text-[10px]"><span className="inline-flex items-center gap-1"><Globe className="h-3 w-3" /> Flipkart</span></TableHead>
-                <TableHead className="text-right text-[10px]">Total Channel</TableHead>
                 <TableHead className="text-center text-[10px]">Risk</TableHead>
                 <TableHead className="text-center"></TableHead>
               </TableRow>
@@ -305,10 +304,10 @@ export default function MultiChannelInventoryPage() {
             <TableBody>
               {loading ? (
                 Array.from({ length: 5 }).map((_, i) => (
-                  <TableRow key={i}>{Array.from({ length: 12 }).map((_, j) => (<TableCell key={j}><div className="h-4 w-full animate-pulse rounded bg-muted" /></TableCell>))}</TableRow>
+                  <TableRow key={i}>{Array.from({ length: 11 }).map((_, j) => (<TableCell key={j}><div className="h-4 w-full animate-pulse rounded bg-muted" /></TableCell>))}</TableRow>
                 ))
               ) : filtered.length === 0 ? (
-                <TableRow><TableCell colSpan={12} className="py-12 text-center text-muted-foreground"><Search className="mx-auto mb-2 h-8 w-8 text-muted-foreground/40" /> {searchTerm ? `No products match “${searchQuery.trim()}”` : 'No products found'}</TableCell></TableRow>
+                <TableRow><TableCell colSpan={11} className="py-12 text-center text-muted-foreground"><Search className="mx-auto mb-2 h-8 w-8 text-muted-foreground/40" /> {searchTerm ? `No products match “${searchQuery.trim()}”` : 'No products found'}</TableCell></TableRow>
               ) : (
                 filtered.map((item) => {
                   const risk = riskConfig[item.riskStatus];
@@ -342,9 +341,6 @@ export default function MultiChannelInventoryPage() {
                         <TableCell className="text-right"><EditableChannelCell item={item} channel="amazonQuantity" editValues={editValues} setEditValues={setEditValues} onSave={handleChannelEditSave} /></TableCell>
                         <TableCell className="text-right"><EditableChannelCell item={item} channel="myntraQuantity" editValues={editValues} setEditValues={setEditValues} onSave={handleChannelEditSave} /></TableCell>
                         <TableCell className="text-right"><EditableChannelCell item={item} channel="flipkartQuantity" editValues={editValues} setEditValues={setEditValues} onSave={handleChannelEditSave} /></TableCell>
-                        <TableCell className="text-right">
-                          <span className={cn('font-mono font-bold', item.totalChannelQuantity > item.availableQuantity ? 'text-rose-500' : 'text-emerald-500')}>{item.totalChannelQuantity}</span>
-                        </TableCell>
                         <TableCell className="text-center">
                           <span className={cn('inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider', risk.className)}>
                             {item.riskStatus === 'OK' && <CheckCircle2 className="h-3 w-3" />}
@@ -361,7 +357,7 @@ export default function MultiChannelInventoryPage() {
                       </TableRow>
                       {isExpanded && (
                         <TableRow className="bg-muted/20">
-                          <TableCell colSpan={12} className="p-4">
+                          <TableCell colSpan={11} className="p-4">
                             <div className="animate-fade-in rounded-lg border border-border/60 bg-card p-5">
                               <div className="mb-4 flex items-center justify-between">
                                 <h3 className="text-sm font-semibold">{item.productTitle}</h3>
@@ -371,7 +367,7 @@ export default function MultiChannelInventoryPage() {
                                 <DetailBox icon={Warehouse} iconClass="text-primary" label="Warehouse" value={item.warehouseQuantity} sub="Physical inventory" />
                                 <DetailBox icon={Lock} iconClass="text-amber-500" label="Reserved" value={item.reservedQuantity} sub="Committed to accepted orders" />
                                 <DetailBox icon={PackageOpen} iconClass={item.availableQuantity === 0 ? 'text-rose-500' : 'text-emerald-500'} label="Available" value={item.availableQuantity} sub="Sellable right now" />
-                                <DetailBox icon={Layers} iconClass={item.totalChannelQuantity > item.availableQuantity ? 'text-rose-500' : 'text-emerald-500'} label="Channel Total" value={item.totalChannelQuantity} sub={item.totalChannelQuantity > item.availableQuantity ? `⚠️ ${item.totalChannelQuantity - item.availableQuantity} over available` : `✅ ${item.availableQuantity - item.totalChannelQuantity} buffer`} />
+                                <DetailBox icon={Tag} iconClass="text-sky-500" label="Unit Price" value={item.unitPrice} sub="Per unit" />
                                 <DetailBox icon={ShoppingBag} iconClass="text-emerald-500" label="Shopify" value={item.shopifyQuantity} sub="Storefront" />
                                 <DetailBox icon={Store} iconClass="text-amber-500" label="Amazon" value={item.amazonQuantity} sub="Mock marketplace" />
                                 <DetailBox icon={Globe} iconClass="text-violet-500" label="Myntra" value={item.myntraQuantity} sub="Mock marketplace" />

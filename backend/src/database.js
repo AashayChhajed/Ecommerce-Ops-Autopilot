@@ -111,8 +111,8 @@ export async function initializeDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS description_settings (
       id BIGSERIAL PRIMARY KEY,
-      tone TEXT NOT NULL DEFAULT 'professional',
-      language TEXT NOT NULL DEFAULT 'English',
+      tone TEXT NOT NULL DEFAULT '',
+      language TEXT NOT NULL DEFAULT '',
       brand_phrases TEXT,
       style_notes TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -120,15 +120,30 @@ export async function initializeDatabase() {
     )
   `);
 
-  // Seed default brand voice if none exists
+  // Seed an empty brand voice row if none exists (no prefilled values —
+  // the user starts with a blank configuration and fills it in themselves)
   const { rowCount: settingsCount } = await pool.query('SELECT 1 FROM description_settings LIMIT 1');
   if (settingsCount === 0) {
     await pool.query(`
       INSERT INTO description_settings (tone, language, brand_phrases, style_notes)
-      VALUES ('professional', 'English', '', 'Focus on quality, craftsmanship, and customer satisfaction.')
+      VALUES ('', '', '', '')
     `);
-    console.log('[DB] Seeded default brand voice settings');
+    console.log('[DB] Seeded empty brand voice settings');
   }
+
+  // Clear legacy prefilled brand voice defaults (rows that exactly match the
+  // old seed values) so the configuration starts blank. Rows that a user has
+  // actually customized are never touched.
+  await pool.query(`
+    UPDATE description_settings SET
+      tone = '',
+      language = '',
+      brand_phrases = '',
+      style_notes = ''
+    WHERE tone = 'professional' AND language = 'English'
+      AND (brand_phrases IS NULL OR brand_phrases = '')
+      AND style_notes = 'Focus on quality, craftsmanship, and customer satisfaction.'
+  `).catch(() => {});
 
   // ── Add columns to descriptions table (idempotent) ───────────────
   const descAdditions = [

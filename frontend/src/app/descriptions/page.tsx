@@ -143,7 +143,7 @@ function BrandVoicePanel({ settings, onSave }: { settings: DescriptionSettings; 
               <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Language</label>
               <select value={local.language} onChange={(e) => setLocal((prev) => ({ ...prev, language: e.target.value }))}
                 className="flex h-9 w-full rounded-[calc(var(--radius)-2px)] border border-input bg-transparent px-3 py-1 text-sm shadow-xs">
-                <option value="English">English</option><option value="Spanish">Spanish</option><option value="French">French</option><option value="German">German</option><option value="Japanese">Japanese</option><option value="Chinese (Simplified)">Chinese (Simplified)</option>
+                <option value="">Select language…</option><option value="English">English</option><option value="Spanish">Spanish</option><option value="French">French</option><option value="German">German</option><option value="Japanese">Japanese</option><option value="Chinese (Simplified)">Chinese (Simplified)</option>
               </select>
             </div>
           </div>

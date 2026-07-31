@@ -154,7 +154,7 @@ export default function SchedulerPage() {
           <Card>
             <CardContent className="flex flex-col items-center py-12 text-center">
               <CalendarClock className="mb-3 h-8 w-8 text-muted-foreground/50" />
-              <p className="text-sm text-muted-foreground">No scheduler runs yet. Jobs will start automatically every 5 minutes.</p>
+              <p className="text-sm text-muted-foreground">No scheduler runs yet. Jobs will start automatically every hour.</p>
             </CardContent>
           </Card>
         ) : (
