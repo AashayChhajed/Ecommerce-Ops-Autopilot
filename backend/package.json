@@ -9,11 +9,13 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
+    "start:worker": "AUTOPILOT_SCHEDULER_ONLY=1 node src/server.js",
     "test": "node --test"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "node-cron": "^4.6.0",
+    "nodemailer": "^9.0.3",
     "pg": "^8.12.0"
   }
 }

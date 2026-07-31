@@ -49,15 +49,78 @@ let workingModel = null;
 // Track which models we've already seen fail to skip them fast
 const failedModels = new Set();
 
+// Cooldown shared across requests in this process to avoid hammering free-tier limits.
+let nextAllowedRequestAt = 0;
+let requestGate = Promise.resolve();
+let lastRequestStartedAt = 0;
+
+const MIN_REQUEST_INTERVAL_MS = Number(process.env.GEMINI_MIN_REQUEST_INTERVAL_MS ?? 15000);
+const GEMINI_REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_REQUEST_TIMEOUT_MS ?? 45000);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function makeRateLimitError(message, retryAfterMs) {
+  const error = new Error(message);
+  error.code = 'GEMINI_RATE_LIMITED';
+  error.retryAfterMs = retryAfterMs;
+  return error;
+}
+
+async function acquireGeminiSlot() {
+  const current = requestGate;
+  let release;
+  requestGate = new Promise((resolve) => {
+    release = resolve;
+  });
+
+  await current;
+
+  const waitMs = Math.max(0, (lastRequestStartedAt + MIN_REQUEST_INTERVAL_MS) - Date.now());
+  if (waitMs > 0) {
+    await sleep(waitMs);
+  }
+
+  lastRequestStartedAt = Date.now();
+  release();
+}
+
+function parseRetryDelayMs(bodyText) {
+  if (!bodyText) return null;
+
+  try {
+    const data = JSON.parse(bodyText);
+    const retryDelay = data?.error?.details?.find((detail) => detail['@type'] === 'type.googleapis.com/google.rpc.RetryInfo')?.retryDelay;
+    if (!retryDelay) return null;
+
+    const match = String(retryDelay).match(/^(\d+(?:\.\d+)?)(ms|s)$/i);
+    if (!match) return null;
+
+    const value = Number(match[1]);
+    return match[2].toLowerCase() === 's' ? Math.round(value * 1000) : Math.round(value);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Build an e-commerce product description prompt.
  *
  * @param {object} product  - Product row from DB (title, vendor, inventory, price, description, etc.)
- * @param {object} options
- * @param {string} [options.tone] - Optional tone: "professional" | "friendly" | "playful" | "expert"
+ * @param {object} [options]
+ * @param {object} [options.brandVoice] - Brand voice settings from description_settings table
+ * @param {string} [options.brandVoice.tone] - "professional" | "friendly" | "playful" | "expert"
+ * @param {string} [options.brandVoice.language] - Language (e.g., "English")
+ * @param {string} [options.brandVoice.brand_phrases] - Key brand phrases or keywords
+ * @param {string} [options.brandVoice.style_notes] - Additional style instructions
+ * @param {string} [options.tone] - Override tone (takes precedence over brandVoice.tone)
  * @returns {string} The formatted prompt text
  */
-export function buildDescriptionPrompt(product, { tone } = {}) {
+export function buildDescriptionPrompt(product, { tone, brandVoice } = {}) {
+  // Determine tone — explicit override wins, then brandVoice, then default
+  const activeTone = tone || brandVoice?.tone || 'professional';
+
   const toneMap = {
     professional:
       'Tone: Professional, engaging, and benefit-focused. Use confident, polished language that builds trust with discerning shoppers.',
@@ -69,9 +132,7 @@ export function buildDescriptionPrompt(product, { tone } = {}) {
       'Tone: Authoritative, technical, and detail-oriented. Emphasize specifications, craftsmanship, and industry expertise.',
   };
 
-  const toneInstruction =
-    toneMap[tone] ||
-    'Tone: Professional, engaging, and benefit-focused.';
+  const toneInstruction = toneMap[activeTone] || toneMap.professional;
 
   const details = [
     `Product Title: ${product.title}`,
@@ -84,7 +145,23 @@ export function buildDescriptionPrompt(product, { tone } = {}) {
     details.push(`Original Description: ${product.description.slice(0, 300)}`);
   }
 
-  return `You are an expert e-commerce copywriter for high-converting online stores. Generate a compelling product description.
+  // Build brand voice section
+  const brandVoiceParts = [];
+  if (brandVoice?.language && brandVoice.language !== 'English') {
+    brandVoiceParts.push(`- Language: Write in **${brandVoice.language}**`);
+  }
+  if (brandVoice?.brand_phrases?.trim()) {
+    brandVoiceParts.push(`- Brand Keywords: Naturally incorporate these phrases when relevant: "${brandVoice.brand_phrases.trim()}"`);
+  }
+  if (brandVoice?.style_notes?.trim()) {
+    brandVoiceParts.push(`- Style Notes: ${brandVoice.style_notes.trim()}`);
+  }
+
+  const brandVoiceBlock = brandVoiceParts.length > 0
+    ? `\nBrand Voice:\n${brandVoiceParts.join('\n')}`
+    : '';
+
+  return `You are an expert e-commerce copywriter for high-converting online stores. Generate a compelling product description.${brandVoiceBlock}
 
 ${details.join('\n')}
 
@@ -117,23 +194,47 @@ export async function generateWithGemini(prompt) {
 
   let lastError = null;
 
+  const cooldownMs = Math.max(0, nextAllowedRequestAt - Date.now());
+  if (cooldownMs > 0) {
+    throw makeRateLimitError(`Gemini rate limited; wait ${Math.ceil(cooldownMs / 1000)}s before retrying`, cooldownMs);
+  }
+
   for (const model of candidates) {
     // Skip models we already know fail
     if (failedModels.has(model)) continue;
 
     const url = `https://generativelanguage.googleapis.com/${GEMINI_API_VERSION}/models/${model}:generateContent?key=${geminiKey}`;
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          maxOutputTokens: 512,
-          temperature: 0.7,
-        },
-      }),
-    });
+    await acquireGeminiSlot();
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(new Error(`Gemini request timed out after ${GEMINI_REQUEST_TIMEOUT_MS}ms`)),
+      GEMINI_REQUEST_TIMEOUT_MS
+    );
+
+    let response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            maxOutputTokens: 512,
+            temperature: 0.7,
+          },
+        }),
+      });
+    } catch (err) {
+      if (controller.signal.aborted || err?.name === 'AbortError') {
+        throw new Error(`Gemini request timed out after ${GEMINI_REQUEST_TIMEOUT_MS}ms while calling ${model}`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     if (response.ok) {
       const data = await response.json();
@@ -160,8 +261,19 @@ export async function generateWithGemini(prompt) {
       continue;
     }
 
-    // Non-404 error (auth, rate limit, etc.) — throw immediately
     const errBody = await response.text().catch(() => '');
+
+    if (response.status === 429) {
+      lastError = new Error(`Gemini API rate limited (${model})`);
+      const retryDelayMs = parseRetryDelayMs(errBody);
+      const waitMs = Math.max(retryDelayMs ?? MIN_REQUEST_INTERVAL_MS, MIN_REQUEST_INTERVAL_MS);
+      nextAllowedRequestAt = Date.now() + waitMs;
+
+      console.warn(`[Gemini] Rate limited on ${model}; cooling down for ${Math.round(waitMs / 1000)}s`);
+      throw makeRateLimitError(`Gemini rate limited on ${model}; retry after ${Math.ceil(waitMs / 1000)}s`, waitMs);
+    }
+
+    // Non-404 error (auth, rate limit after retries, etc.) — throw immediately
     throw new Error(`Gemini API error (${response.status}): ${errBody}`);
   }
 
@@ -181,4 +293,7 @@ export async function generateWithGemini(prompt) {
 export function resetModelCache() {
   workingModel = null;
   failedModels.clear();
+  nextAllowedRequestAt = 0;
+  requestGate = Promise.resolve();
+  lastRequestStartedAt = 0;
 }

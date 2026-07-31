@@ -1,12 +1,20 @@
 import cron from 'node-cron';
 import { query } from './database.js';
 
+const runningJobs = new Set();
+
 /**
  * Wraps a job function with:
  * - scheduler_runs record (started, finished, status, duration)
  * - Independent error isolation (one job crash never stops others)
  */
 async function runJob(jobName, fn, { logActivity }) {
+  if (runningJobs.has(jobName)) {
+    console.log(`[Scheduler] Skipping ${jobName} because a previous run is still active`);
+    return;
+  }
+
+  runningJobs.add(jobName);
   const startTime = Date.now();
   let runId;
 
@@ -48,36 +56,54 @@ async function runJob(jobName, fn, { logActivity }) {
       `Job "${jobName}" failed: ${err.message}`,
       'ERROR'
     ).catch(() => {});
+  } finally {
+    runningJobs.delete(jobName);
   }
 }
 
-export function startScheduler({ fullSync, auditInventory, sendOrderNotifications, generateMissingDescriptions, logActivity }) {
+export function startScheduler({ fullSync, auditInventory, sendOrderNotifications, generateMissingDescriptions, reconcileChannelListings, logActivity }) {
   console.log('[Scheduler] Starting background job engine...');
 
-  // ── Job 1: Full Shopify Sync — every 5 minutes ──────────────────────────
-  cron.schedule('*/5 * * * *', () => {
+  // ── Job 1: Full Shopify Sync — every 15 minutes ─────────────────────────
+  cron.schedule('*/15 * * * *', () => {
     runJob('ShopifySyncJob', () => fullSync(), { logActivity });
   });
 
-  // ── Job 2: Inventory Audit — every 5 minutes (offset 30s) ───────────────
+  // ── Job 2: Inventory Audit — every 15 minutes (offset 30s) ──────────────
   // We stagger by 30s inside the handler to avoid race conditions
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('*/15 * * * *', async () => {
     await new Promise((r) => setTimeout(r, 30_000)); // 30s stagger
     runJob('InventoryAuditJob', () => auditInventory(), { logActivity });
   });
 
-  // ── Job 3: Order Notifications — every 5 minutes (offset 15s) ───────────
-  cron.schedule('*/5 * * * *', async () => {
+  // ── Job 3: Order Notifications — every 15 minutes (offset 15s) ──────────
+  cron.schedule('*/15 * * * *', async () => {
     await new Promise((r) => setTimeout(r, 15_000)); // 15s stagger
     runJob('OrderNotificationJob', () => sendOrderNotifications(), { logActivity });
   });
 
-  // ── Job 4: AI Description Generation — every 60 minutes ──────────────────
-  cron.schedule('0 * * * *', () => {
+  // ── Job 4: Listing Reconcile — every 15 minutes (offset 45s) ────────────
+  // Caps every channel listing to warehouse availability so marketplaces never
+  // advertise more than the warehouse can fulfill — the primary anti-penalty
+  // safeguard (no order for stock that doesn't exist).
+  cron.schedule('*/15 * * * *', async () => {
+    await new Promise((r) => setTimeout(r, 45_000)); // 45s stagger
+    runJob('ListingReconcileJob', async () => {
+      const result = await reconcileChannelListings();
+      await logActivity(
+        'LISTING_RECONCILE',
+        `Auto-reconciled ${result.adjusted} channel listing(s) to warehouse availability.`,
+        result.adjusted ? 'INFO' : 'SUCCESS'
+      );
+    }, { logActivity });
+  });
+
+  // ── Job 5: AI Description Generation — every 2 hours ─────────────────────
+  cron.schedule('0 */2 * * *', () => {
     runJob('DescriptionGenerationJob', () => generateMissingDescriptions(), { logActivity });
   });
 
-  // ── Job 5: Log Cleanup — daily at 02:00 ─────────────────────────────────
+  // ── Job 6: Log Cleanup — daily at 02:00 ─────────────────────────────────
   cron.schedule('0 2 * * *', () => {
     runJob('LogCleanupJob', async () => {
       const { rowCount } = await query(
@@ -87,5 +113,5 @@ export function startScheduler({ fullSync, auditInventory, sendOrderNotification
     }, { logActivity });
   });
 
-  console.log('[Scheduler] ✔ Jobs registered: ShopifySyncJob (*/5m), InventoryAuditJob (*/5m+30s), OrderNotificationJob (*/5m+15s), DescriptionGenerationJob (hourly), LogCleanupJob (daily 02:00)');
+  console.log('[Scheduler] ✔ Jobs registered: ShopifySyncJob (*/15m), InventoryAuditJob (*/15m+30s), OrderNotificationJob (*/15m+15s), ListingReconcileJob (*/15m+45s), DescriptionGenerationJob (every 2h), LogCleanupJob (daily 02:00)');
 }

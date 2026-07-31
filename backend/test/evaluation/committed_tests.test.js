@@ -1,6 +1,13 @@
 // Prevent server startup when lib.js imports database.js (which indirectly reaches server.js)
 process.env.AUTOPILOT_SKIP_START = '1';
 
+// NEVER send real emails from tests — force mock delivery so automated runs
+// cannot consume Mailtrap sandbox quota or trigger rate limits.
+// NB: safe to assign here (after imports) because emailService only builds
+// its transporter lazily on first sendEmail() — keep it lazy, don't create
+// the transport at module scope, or this flag will no longer be in effect.
+process.env.EMAIL_MOCK_MODE = '1';
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

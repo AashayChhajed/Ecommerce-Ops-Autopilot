@@ -1,3 +1,7 @@
+// Defense-in-depth: never send real emails from tests (see emailService.js
+// EMAIL_MOCK_MODE flag). node --test runs each file in its own process.
+process.env.EMAIL_MOCK_MODE = '1';
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { productFromShopify, shopifyBaseUrl, toApiProduct, orderFromShopify, toApiOrder, toApiInventoryAlert, toApiActivityLog } from '../src/lib.js';
@@ -9,7 +13,7 @@ test('builds a Shopify Admin API URL from a shop name', () => {
 test('maps all Shopify variant inventory into one product', () => {
   const product = productFromShopify({ id: '1', title: 'Mug', variants: [{ price: '9.99', inventory_quantity: 2 }, { price: '12.99', inventory_quantity: 3 }] });
   assert.equal(product.inventory, 5);
-  assert.equal(product.price, '9.99');
+  assert.equal(product.price, 9.99);
 });
 
 test('serializes database rows into the public API shape', () => {
@@ -23,7 +27,7 @@ test('maps a Shopify order to database format', () => {
   assert.equal(order.shopifyOrderId, 42);
   assert.equal(order.customerName, 'John Doe');
   assert.equal(order.email, 'john@example.com');
-  assert.equal(order.total, '129.99');
+  assert.equal(order.total, 129.99);
 });
 
 test('maps order without customer gracefully', () => {
@@ -34,7 +38,21 @@ test('maps order without customer gracefully', () => {
 
 test('serializes order DB row to API shape', () => {
   const api = toApiOrder({ id: '1', shopify_order_id: '42', customer_name: 'John Doe', email: 'j@j.com', status: 'paid', total: '129.99', created_at: '2026-07-27' });
-  assert.deepEqual(api, { id: 1, shopifyOrderId: 42, customerName: 'John Doe', email: 'j@j.com', status: 'paid', total: 129.99, createdAt: '2026-07-27' });
+  assert.deepEqual(api, {
+    id: 1,
+    shopifyOrderId: 42,
+    channelCode: 'SHOPIFY',
+    orderReference: null,
+    allocationStatus: 'UNCHECKED',
+    allocationNotes: null,
+    itemCount: null,
+    customerName: 'John Doe',
+    email: 'j@j.com',
+    status: 'paid',
+    total: 129.99,
+    notificationStatus: 'UNNOTIFIED',
+    createdAt: '2026-07-27',
+  });
 });
 
 test('serializes inventory alert DB row to API shape', () => {
