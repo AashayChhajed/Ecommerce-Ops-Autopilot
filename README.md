@@ -49,3 +49,12 @@ The frontend is available at `http://localhost:3000` and expects the backend at 
 cd backend
 npm test
 ```
+
+## Deploy
+
+- **Backend + PostgreSQL → Render** (blueprint: `render.yaml`) and **Frontend → Vercel**:
+  see [DEPLOYMENT.md](DEPLOYMENT.md) for the full step-by-step guide, env var tables,
+  keep-alive setup for the free-tier scheduler, and verification steps.
+- The frontend connects to the backend via `NEXT_PUBLIC_API_BASE_URL`
+  (defaults to `http://localhost:4000`).
+- Copy `backend/.env.example` → repo root `.env` (or `backend/.env`) for local development.

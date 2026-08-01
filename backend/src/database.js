@@ -194,6 +194,7 @@ export async function initializeDatabase() {
   const productAdditions = [
     `ALTER TABLE products ADD COLUMN IF NOT EXISTS warehouse_quantity INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE products ADD COLUMN IF NOT EXISTS sku TEXT`,
+    `ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT`,
   ];
   for (const sql of productAdditions) {
     await pool.query(sql).catch(() => {});

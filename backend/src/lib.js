@@ -20,6 +20,9 @@ export function productFromShopify(product) {
     status: product.status ?? null,
     price: Number(firstVariant?.price ?? 0),
     inventory: variants.reduce((total, v) => total + Number(v.inventory_quantity ?? 0), 0),
+    // Shopify product payloads carry the main image on `image.src` and the
+    // full gallery under `images[].src` — capture whichever is available.
+    imageUrl: product.image?.src ?? product.images?.[0]?.src ?? null,
   };
 }
 
@@ -33,6 +36,7 @@ export function toApiProduct(row) {
     status: row.status,
     inventory: Number(row.inventory),
     price: Number(row.price),
+    imageUrl: row.image_url ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -583,6 +587,7 @@ export function toApiUnifiedInventoryItem(row, bufferPercent = 100) {
     productId: Number(row.id),
     productTitle: row.title,
     sku: row.sku ?? null,
+    imageUrl: row.image_url ?? null,
     unitPrice: Number(row.price ?? 0),
     warehouseQuantity: warehouseQty,
     reservedQuantity: allocatedQty,
@@ -607,6 +612,7 @@ export async function getUnifiedInventory() {
       p.id,
       p.title,
       p.sku,
+      p.image_url,
       p.price,
       p.warehouse_quantity,
       p.allocated_quantity,

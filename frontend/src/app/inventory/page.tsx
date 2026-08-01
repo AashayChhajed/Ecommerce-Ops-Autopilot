@@ -18,6 +18,7 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import { Input } from '@/components/ui/input';
+import ProductThumb from '@/components/ProductThumb';
 import { cn } from '@/lib/utils';
 
 type RiskFilter = 'ALL' | 'OK' | 'OVERSELL_RISK' | 'CHANNEL_MISMATCH';
@@ -85,6 +86,7 @@ export default function MultiChannelInventoryPage() {
   const [bufferDraft, setBufferDraft] = useState('100');
   const [savingBuffer, setSavingBuffer] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [bufferOpen, setBufferOpen] = useState(false);
 
   const load = useCallback(async (quiet = false) => {
     // quiet skips the skeleton state — used for background refreshes (e.g.
@@ -198,25 +200,41 @@ export default function MultiChannelInventoryPage() {
         </CardContent>
       </Card>
 
-      {/* Safety buffer control */}
+      {/* Safety buffer control — collapsed by default, expands on click to save space */}
       <Card className="border-amber-500/20 bg-gradient-to-r from-amber-500/[0.04] to-transparent">
-        <CardContent className="p-5">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex items-start gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-amber-500/10">
-                <ShieldCheck className="h-5 w-5 text-amber-500" />
-              </div>
-              <div>
-                <h2 className="text-sm font-semibold">Over-Order Safety Buffer</h2>
-                <p className="mt-0.5 max-w-xl text-xs text-muted-foreground">
-                  The guard only sells <strong className="text-foreground">{bufferPercent}%</strong> of warehouse stock
-                  (available = floor(warehouse × {bufferPercent}%) − reserved). Reserving a buffer means returns,
-                  damage and in-transit units never push you into a stockout — and it protects your seller rating
-                  across all channels.
-                </p>
-              </div>
+        <button
+          type="button"
+          onClick={() => setBufferOpen((v) => !v)}
+          aria-expanded={bufferOpen}
+          className="flex w-full items-center justify-between gap-3 rounded-lg p-5 text-left transition-colors hover:bg-amber-500/[0.03] focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+        >
+          <div className="flex items-start gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-amber-500/10">
+              <ShieldCheck className="h-5 w-5 text-amber-500" />
             </div>
-            <div className="flex items-center gap-3">
+            <div>
+              <h2 className="text-sm font-semibold">Over-Order Safety Buffer</h2>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {bufferOpen
+                  ? 'Sellable stock is a % of warehouse stock — tune it below'
+                  : `Sellable stock is currently ${bufferPercent}% of warehouse. Click to view details.`}
+              </p>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2.5">
+            <span className="rounded-full border border-amber-500/20 bg-amber-500/10 px-2.5 py-0.5 text-xs font-bold text-amber-600 dark:text-amber-400">{bufferPercent}%</span>
+            {bufferOpen ? <ChevronUp className="h-4 w-4 text-muted-foreground" /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}
+          </div>
+        </button>
+        {bufferOpen && (
+          <div className="animate-fade-in border-t border-border/60 p-5 pt-4">
+            <p className="mb-4 max-w-xl text-xs text-muted-foreground">
+              The guard only sells <strong className="text-foreground">{bufferPercent}%</strong> of warehouse stock
+              (available = floor(warehouse × {bufferPercent}%) − reserved). Reserving a buffer means returns,
+              damage and in-transit units never push you into a stockout — and it protects your seller rating
+              across all channels.
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
               <input
                 type="range" min={1} max={100} step={1} value={bufferDraft}
                 onChange={(e) => setBufferDraft(e.target.value)}
@@ -236,7 +254,7 @@ export default function MultiChannelInventoryPage() {
               </Button>
             </div>
           </div>
-        </CardContent>
+        )}
       </Card>
 
       {/* KPI cards */}
@@ -315,7 +333,12 @@ export default function MultiChannelInventoryPage() {
                   return (
                     <React.Fragment key={item.productId}>
                       <TableRow className={cn(item.riskStatus !== 'OK' && 'bg-destructive/[0.02]')}>
-                        <TableCell className="max-w-[200px]"><p className="font-medium truncate" title={item.productTitle}>{item.productTitle}</p></TableCell>
+                        <TableCell className="max-w-[220px]">
+                          <div className="flex items-center gap-2.5">
+                            <ProductThumb src={item.imageUrl} title={item.productTitle} />
+                            <p className="min-w-0 font-medium truncate" title={item.productTitle}>{item.productTitle}</p>
+                          </div>
+                        </TableCell>
                         <TableCell className="font-mono text-xs text-muted-foreground">{item.sku || '—'}</TableCell>
                         <TableCell className="text-right">
                           {editingWarehouse === item.productId ? (

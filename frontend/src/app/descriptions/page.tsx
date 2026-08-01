@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from 'react';
 import {
   Sparkles, RefreshCcw, CheckCircle2, X, Eye, AlertCircle,
   Send, MessageSquare, FileText, Play,
-  Filter
+  Filter, ChevronDown, ChevronUp
 } from 'lucide-react';
 import {
   fetchDescriptions, fetchDescriptionSettings, fetchDescriptionMetrics,
@@ -15,7 +15,7 @@ import {
 import { Description, DescriptionSettings, DescriptionMetrics, Product } from '@/types/api';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardTitle } from '@/components/ui/card';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
@@ -105,6 +105,7 @@ function BrandVoicePanel({ settings, onSave }: { settings: DescriptionSettings; 
   const [local, setLocal] = useState<DescriptionSettings>(settings);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [open, setOpen] = useState(false);
   useEffect(() => setLocal(settings), [settings]);
 
   const TONES = [
@@ -118,13 +119,20 @@ function BrandVoicePanel({ settings, onSave }: { settings: DescriptionSettings; 
 
   return (
     <Card>
-      <CardHeader className="border-b border-border/60">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center justify-between gap-3 rounded-lg p-4 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+      >
         <div className="flex items-center gap-3">
           <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10"><MessageSquare className="h-4 w-4 text-primary" /></div>
           <div><CardTitle className="text-sm">Brand Voice Configuration</CardTitle><p className="text-xs text-muted-foreground">Customize how AI describes your products</p></div>
         </div>
-      </CardHeader>
-      <CardContent className="pt-6">
+        {open ? <ChevronUp className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />}
+      </button>
+      {open && (
+      <CardContent className="pt-6 animate-fade-in">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-8 gap-y-5">
           <div className="space-y-5">
             <div>
@@ -167,6 +175,7 @@ function BrandVoicePanel({ settings, onSave }: { settings: DescriptionSettings; 
           </Button>
         </div>
       </CardContent>
+      )}
     </Card>
   );
 }

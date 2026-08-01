@@ -49,12 +49,11 @@ function OrderStatusBadge({ status }: { status: string }) {
   return <Badge variant={m.variant}>{m.label}</Badge>;
 }
 
-const CHANNELS = ['SHOPIFY', 'AMAZON_MOCK', 'MYNTRA_MOCK', 'FLIPKART_MOCK'] as const;
+const CHANNELS = ['AMAZON_MOCK', 'MYNTRA_MOCK', 'FLIPKART_MOCK'] as const;
 const CHANNEL_LABELS: Record<string, string> = {
-  SHOPIFY: 'Shopify',
-  AMAZON_MOCK: 'Amazon (Mock)',
-  MYNTRA_MOCK: 'Myntra (Mock)',
-  FLIPKART_MOCK: 'Flipkart (Mock)',
+  AMAZON_MOCK: 'Amazon',
+  MYNTRA_MOCK: 'Myntra',
+  FLIPKART_MOCK: 'Flipkart',
 };
 
 export default function OrdersPage() {

@@ -7,6 +7,7 @@ export interface Product {
   status: string | null;
   inventory: number;
   price: number;
+  imageUrl: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -234,6 +235,7 @@ export interface UnifiedInventoryItem {
   productId: number;
   productTitle: string;
   sku: string | null;
+  imageUrl: string | null;
   unitPrice: number;
   warehouseQuantity: number;
   reservedQuantity: number;

@@ -9,6 +9,7 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
+import ProductThumb from '@/components/ProductThumb';
 import { cn } from '@/lib/utils';
 
 type FilterStatus = 'all' | 'active' | 'draft' | 'archived';
@@ -228,8 +229,13 @@ export default function ProductsPage() {
                 filtered.map((p) => (
                   <TableRow key={p.id}>
                     <TableCell className="max-w-xs">
-                      <p className="font-medium truncate">{p.title}</p>
-                      <p className="text-xs text-muted-foreground">ID: {p.shopifyProductId}</p>
+                      <div className="flex items-center gap-3">
+                        <ProductThumb src={p.imageUrl} title={p.title} />
+                        <div className="min-w-0">
+                          <p className="font-medium truncate">{p.title}</p>
+                          <p className="text-xs text-muted-foreground">ID: {p.shopifyProductId}</p>
+                        </div>
+                      </div>
                     </TableCell>
                     <TableCell className="text-muted-foreground">{p.vendor ?? '—'}</TableCell>
                     <TableCell className="text-right font-mono">${Number(p.price).toFixed(2)}</TableCell>

@@ -154,19 +154,20 @@ export async function syncProducts() {
 
   if (products.length) {
     const values = products.map((_, i) => {
-      const b = i * 7 + 1;
-      return `($${b},$${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},NOW(),NOW())`;
+      const b = i * 8 + 1;
+      return `($${b},$${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},NOW(),NOW())`;
     });
     const flat = products.flatMap((p) => [
       p.shopifyProductId, p.title, p.description, p.vendor,
-      p.status, p.inventory, p.price,
+      p.status, p.inventory, p.price, p.imageUrl,
     ]);
     await query(`
-      INSERT INTO products (shopify_product_id, title, description, vendor, status, inventory, price, created_at, updated_at)
+      INSERT INTO products (shopify_product_id, title, description, vendor, status, inventory, price, image_url, created_at, updated_at)
       VALUES ${values.join(',')}
       ON CONFLICT (shopify_product_id) DO UPDATE SET
         title = EXCLUDED.title, description = EXCLUDED.description, vendor = EXCLUDED.vendor,
         status = EXCLUDED.status, inventory = EXCLUDED.inventory, price = EXCLUDED.price,
+        image_url = EXCLUDED.image_url,
         updated_at = NOW()
     `, flat);
   }
