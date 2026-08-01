@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard, Package, ShoppingCart, Bell,
-  ClipboardList, CalendarClock, Rocket, Sparkles, MessageSquare
+  ClipboardList, Rocket, Sparkles, MessageSquare
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -17,7 +17,6 @@ const links = [
   { href: '/inventory', label: 'Inventory', icon: Bell },
   { href: '/descriptions', label: 'Descriptions', icon: MessageSquare },
   { href: '/logs', label: 'Logs', icon: ClipboardList },
-  { href: '/scheduler', label: 'Scheduler', icon: CalendarClock },
 ];
 
 export default function Navbar() {
