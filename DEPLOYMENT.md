@@ -5,8 +5,7 @@ This project is split into three deployable pieces:
 | Piece | Where it runs | What it is |
 |---|---|---|
 | **Database** | Render free Postgres | Managed PostgreSQL, created by the blueprint |
-| **Backend API** | Render free web service | `backend/` — Node 22 ESM, custom HTTP router, API only |
-| **Scheduler worker** | Render worker | `backend/` — same codebase, cron jobs only |
+| **Backend API + scheduler** | Render free web service | `backend/` — Node 22 ESM, custom HTTP router, cron jobs run in-process |
 | **Frontend** | Vercel | `frontend/` — Next.js 16 dashboard |
 
 Everything is wired via environment variables; no code changes are needed to deploy.
@@ -26,16 +25,15 @@ git add -A && git commit -m "Deploy prep: render.yaml blueprint, env example, de
 
 ---
 
-## 1. Deploy the database + backend services to Render
+## 1. Deploy the database + backend to Render
 
 **Option A — Blueprint (recommended, does both at once):**
 
 1. Go to [dashboard.render.com](https://dashboard.render.com) → **New +** → **Blueprint**.
 2. Connect the `AashayChhajed/Ecommerce-Ops-Autopilot` repo.
-3. Render reads `render.yaml` and shows three resources to create:
+3. Render reads `render.yaml` and shows two resources to create:
    - `ecommerce-ops-autopilot-db` (free Postgres)
    - `ecommerce-ops-autopilot-api` (free web service, rootDir `backend`)
-   - `ecommerce-ops-autopilot-scheduler` (worker service, rootDir `backend`)
 4. Click **Apply**. Render provisions the DB, then builds & deploys the API.
    > If Apply errors on the free database (some accounts restrict free DBs in blueprints),
    > create the Postgres manually via Option B below and just point both backend services at it.
@@ -44,8 +42,7 @@ git add -A && git commit -m "Deploy prep: render.yaml blueprint, env example, de
 
 - **Postgres:** New + → PostgreSQL → Free plan → Create. Copy the **Internal Database URL**.
 - **Web service:** New + → Web Service → connect repo → Root Directory: `backend` → Runtime: Node → Build: `npm install` → Start: `npm start`. Free plan.
-- **Worker service:** New + → Background Worker → connect repo → Root Directory: `backend` → Runtime: Node → Build: `npm install` → Start: `npm run start:worker`.
-- Add the env vars from the tables below (including `DATABASE_URL` from the DB you just created).
+- Add the env vars from the table below (including `DATABASE_URL` from the DB you just created).
 
 ### Env vars to set on the web service
 
@@ -53,7 +50,6 @@ git add -A && git commit -m "Deploy prep: render.yaml blueprint, env example, de
 |---|---|---|
 | `DATABASE_URL` | auto-wired by blueprint (else paste Internal DB URL) | ✅ |
 | `NODE_VERSION` | `22.14.0` (set by blueprint) | ✅ |
-| `AUTOPILOT_DISABLE_SCHEDULER` | `1` | ✅ |
 | `CORS_ORIGIN` | your Vercel URL, e.g. `https://ecommerce-ops-autopilot.vercel.app` | ✅ for UI |
 | `ADMIN_PANEL_URL` | same Vercel URL (used in email "View in Dashboard" link) | optional |
 | `GEMINI_API_KEY` | your Google AI Studio key — without it descriptions are **mock** text | recommended |
@@ -66,30 +62,13 @@ git add -A && git commit -m "Deploy prep: render.yaml blueprint, env example, de
 | `ADMIN_EMAIL` | recipient for low-stock alerts | optional |
 | `SAFETY_BUFFER_PERCENT` | over-order guard buffer, default `100` | optional |
 
-### Env vars to set on the worker service
-
-| Variable | Value | Required? |
-|---|---|---|
-| `DATABASE_URL` | auto-wired by blueprint (else paste Internal DB URL) | ✅ |
-| `NODE_VERSION` | `22.14.0` (set by blueprint) | ✅ |
-| `AUTOPILOT_SCHEDULER_ONLY` | `1` | ✅ |
-| `GEMINI_API_KEY` | same as web service | recommended |
-| `GEMINI_MODEL_NAME` | same as web service | optional |
-| `SHOPIFY_SHOP_NAME` | same as web service | for live sync |
-| `SHOPIFY_ACCESS_TOKEN` | same as web service | for live sync |
-| `SHOPIFY_API_VERSION` | `2024-04` | optional |
-| `MAILTRAP_HOST/PORT/USERNAME/PASSWORD` | same as web service | optional |
-| `MAILTRAP_FROM_EMAIL` / `MAILTRAP_FROM_NAME` | same as web service | optional |
-| `ADMIN_EMAIL` | same as web service | optional |
-| `SAFETY_BUFFER_PERCENT` | same as web service | optional |
-
 > `SHOPIFY_SYNC_ENABLED=false` disables scheduled Shopify syncs if you don't want them.
 
 ### Keep the free web service awake (important!)
 
 Render's **free web service spins down after ~15 min of no traffic** — and the in-process cron
-scheduler only fires while the process is alive. Since we chose the "scheduler in-process"
-architecture, add a free uptime monitor to ping the health endpoint every ~5 minutes:
+scheduler only fires while the process is alive. Add a free uptime monitor to ping the health
+endpoint every ~5 minutes:
 
 - **[UptimeRobot](https://uptimerobot.com)** (free): add a monitor → type **HTTPS** →
   URL `https://<your-api>.onrender.com/actuator/health` → interval **5 minutes** → Create.
@@ -124,7 +103,8 @@ That single ping keeps the service warm 24/7, so all 6 cron jobs run on schedule
    If you see CORS errors, fix `CORS_ORIGIN` on Render (must match the Vercel origin exactly, no trailing slash).
 3. **Sync:** click **Shopify** or **Sync All** on the dashboard — products + orders should populate.
 4. **Scheduler:** open the **Scheduler** page — jobs (`ShopifySyncJob`, `InventoryAuditJob`, …)
-   should show runs within the hour.
+   should show runs within the hour. If you later upgrade to a Render plan that supports workers,
+   you can move cron into a separate worker, but the free plan should keep it in-process.
 5. **Images:** product thumbnails appear once Shopify sync stores `image_url` (existing rows get
    images on the next sync).
 
@@ -134,7 +114,7 @@ That single ping keeps the service warm 24/7, so all 6 cron jobs run on schedule
 
 | Service | Free tier | Caveats |
 |---|---|---|
-| **Render web service** | 750 instance-hrs/mo | Spins down after 15 min idle → keep-alive ping needed; ephemeral disk (fine — data lives in Postgres) |
+| **Render web service** | 750 instance-hrs/mo | Spins down after 15 min idle → keep-alive ping needed; ephemeral disk (fine — data lives in Postgres); hosts API + scheduler |
 | **Render Postgres (free)** | 1 GB, auto-expires **after 30 days** | Plan to migrate to a paid DB or Neon before expiry; `render.yaml` makes the swap a one-env-var change |
 | **Vercel Hobby** | 100 GB-hrs, 1M funcs/mo | Plenty for a client-side dashboard |
 | **Gemini API** | 10–15 RPM free | Description generation batches are throttled (15s between requests) and pause on 429s |

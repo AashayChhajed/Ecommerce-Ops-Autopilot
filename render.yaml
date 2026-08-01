@@ -1,4 +1,4 @@
-# Render Blueprint — deploys the backend API, scheduler worker, and PostgreSQL.
+# Render Blueprint — deploys the backend API + scheduler together, plus PostgreSQL.
 # Docs: https://render.com/docs/blueprint-spec
 #
 # Usage: connect this repo in Render → "New +" → "Blueprint" → select render.yaml.
@@ -23,8 +23,6 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22.14.0"
-      - key: AUTOPILOT_DISABLE_SCHEDULER
-        value: "1"
       # Auto-wired to the free Postgres created above.
       - key: DATABASE_URL
         fromDatabase:
@@ -68,47 +66,3 @@ services:
       # ── Optional tuning ──
       # - key: SAFETY_BUFFER_PERCENT   # default 100
       # - key: SHOPIFY_SYNC_BACKOFF_MS # default 1800000
-
-  - type: worker
-    name: ecommerce-ops-autopilot-scheduler
-    runtime: node
-    rootDir: backend
-    plan: free
-    buildCommand: npm install
-    startCommand: npm run start:worker
-    envVars:
-      - key: NODE_VERSION
-        value: "22.14.0"
-      - key: AUTOPILOT_SCHEDULER_ONLY
-        value: "1"
-      - key: DATABASE_URL
-        fromDatabase:
-          name: ecommerce-ops-autopilot-db
-          property: connectionString
-      # The worker needs the same operational env vars as the API.
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: GEMINI_MODEL_NAME
-        sync: false
-      - key: SHOPIFY_SHOP_NAME
-        sync: false
-      - key: SHOPIFY_ACCESS_TOKEN
-        sync: false
-      - key: SHOPIFY_API_VERSION
-        value: "2024-04"
-      - key: MAILTRAP_HOST
-        sync: false
-      - key: MAILTRAP_PORT
-        sync: false
-      - key: MAILTRAP_USERNAME
-        sync: false
-      - key: MAILTRAP_PASSWORD
-        sync: false
-      - key: MAILTRAP_FROM_EMAIL
-        sync: false
-      - key: MAILTRAP_FROM_NAME
-        sync: false
-      - key: ADMIN_EMAIL
-        sync: false
-      - key: SAFETY_BUFFER_PERCENT
-        sync: false
