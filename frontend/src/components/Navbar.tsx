@@ -31,7 +31,7 @@ export default function Navbar() {
             <Rocket className="h-4 w-4" />
           </div>
           <div className="hidden sm:block">
-            <h1 className="text-sm font-bold tracking-tight text-foreground">Ops Autopilot</h1>
+            <h1 className="text-sm font-bold tracking-tight text-foreground">Ecom Autopilot</h1>
           </div>
         </Link>
 

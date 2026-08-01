@@ -69,9 +69,9 @@ export default function Dashboard() {
                   <span className={cn('h-1.5 w-1.5 rounded-full', health.db === 'UP' ? 'bg-emerald-500' : health.db === 'CHECKING' ? 'bg-amber-500' : 'bg-rose-500')} />
                 </span>
               </div>
-              <h1 className="text-xl font-bold tracking-tight sm:text-2xl">E-Commerce Operations Autopilot</h1>
+              <h1 className="text-xl font-bold tracking-tight sm:text-2xl">E-Com Autopilot</h1>
               <p className="max-w-xl text-sm leading-relaxed text-muted-foreground">
-                Monitor store health, sync products and orders from Shopify, and track operational KPIs in real time.
+                Automating e-commerce operations
               </p>
             </div>
             <Button size="lg" onClick={handleSync} disabled={isSyncing} className="shrink-0">
