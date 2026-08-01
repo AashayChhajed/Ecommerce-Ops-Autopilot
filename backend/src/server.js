@@ -154,19 +154,24 @@ export async function syncProducts() {
 
   if (products.length) {
     const values = products.map((_, i) => {
-      const b = i * 8 + 1;
-      return `($${b},$${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},NOW(),NOW())`;
+      const b = i * 9 + 1;
+      return `($${b},$${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},NOW(),NOW())`;
     });
     const flat = products.flatMap((p) => [
       p.shopifyProductId, p.title, p.description, p.vendor,
-      p.status, p.inventory, p.price, p.imageUrl,
+      p.status, p.inventory, p.inventory, p.price, p.imageUrl,
     ]);
     await query(`
-      INSERT INTO products (shopify_product_id, title, description, vendor, status, inventory, price, image_url, created_at, updated_at)
+      INSERT INTO products (shopify_product_id, title, description, vendor, status, inventory, warehouse_quantity, price, image_url, created_at, updated_at)
       VALUES ${values.join(',')}
       ON CONFLICT (shopify_product_id) DO UPDATE SET
         title = EXCLUDED.title, description = EXCLUDED.description, vendor = EXCLUDED.vendor,
-        status = EXCLUDED.status, inventory = EXCLUDED.inventory, price = EXCLUDED.price,
+        status = EXCLUDED.status, inventory = EXCLUDED.inventory,
+        warehouse_quantity = CASE
+          WHEN products.warehouse_quantity = 0 THEN EXCLUDED.inventory
+          ELSE products.warehouse_quantity
+        END,
+        price = EXCLUDED.price,
         image_url = EXCLUDED.image_url,
         updated_at = NOW()
     `, flat);
