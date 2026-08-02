@@ -7,7 +7,7 @@ import './globals.css';
 const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
 
 export const metadata: Metadata = {
-  title: 'E-Commerce Ops Autopilot | WeSee Frontier Trial',
+  title: 'E-Commerce Ops Autopilot',
   description: 'Enterprise-grade Shopify operations automation dashboard — sync products, monitor inventory, generate AI descriptions, and track KPIs.',
 };
 
