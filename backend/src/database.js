@@ -162,6 +162,15 @@ export async function initializeDatabase() {
     END WHERE description_status IS NULL OR description_status = ''
   `).catch(() => {});
 
+  // Prevent duplicate descriptions: only one unapproved description per product
+  // (the ON CONFLICT in lib.js uses DO NOTHING, but a unique index enforces at the DB level)
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_descriptions_product_pending
+    ON descriptions(product_id)
+    WHERE approved = FALSE
+      AND COALESCE(description_status, '') != 'published'
+  `).catch(() => {});
+
   // ── Multi-Channel Inventory ────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS channels (

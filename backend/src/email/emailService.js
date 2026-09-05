@@ -176,9 +176,10 @@ export async function sendOrderNotification(order) {
     return { sent: false, mock: false, messageId: null, reason: 'no_recipient' };
   }
 
-  const subject = `Order Confirmed — #${order.shopify_order_id}`;
-  const html = buildOrderEmailHtml(order);
-  const text = buildOrderEmailPlainText(order);
+  const displayId = order.shopify_order_id ?? `INT-${order.id ?? 'unknown'}`;
+  const subject = `Order Confirmed — #${displayId}`;
+  const html = buildOrderEmailHtml({ ...order, shopify_order_id: displayId });
+  const text = buildOrderEmailPlainText({ ...order, shopify_order_id: displayId });
 
   return sendEmail({ to, subject, text, html });
 }

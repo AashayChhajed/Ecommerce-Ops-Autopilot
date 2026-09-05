@@ -5,3 +5,12 @@ backend/backend-startup.log
 
 # Local environment secrets
 .env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

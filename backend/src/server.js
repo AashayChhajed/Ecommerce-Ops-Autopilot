@@ -97,17 +97,32 @@ function parseBody(req) {
 // ──────────────────────────────────────────────
 // Shopify fetcher with retry
 // ──────────────────────────────────────────────
+const SHOPIFY_FETCH_TIMEOUT_MS = Number(process.env.SHOPIFY_FETCH_TIMEOUT_MS ?? 30000);
+
 async function shopifyFetch(path) {
   if (!shopifyToken) throw new Error('SHOPIFY_ACCESS_TOKEN is not configured');
   const url = `${shopifyBaseUrl(process.env.SHOPIFY_SHOP_NAME, process.env.SHOPIFY_API_VERSION)}${path}`;
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const response = await fetch(url, { headers: { 'X-Shopify-Access-Token': shopifyToken } });
-      if (!response.ok) throw new Error(`Shopify returned ${response.status} ${response.statusText}`);
-      return await response.json();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), SHOPIFY_FETCH_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, {
+          headers: { 'X-Shopify-Access-Token': shopifyToken },
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (!response.ok) throw new Error(`Shopify returned ${response.status} ${response.statusText}`);
+        return await response.json();
+      } finally {
+        clearTimeout(timeoutId);
+      }
     } catch (error) {
       lastError = error;
+      if (error.name === 'AbortError') {
+        lastError = new Error(`Shopify fetch timed out after ${SHOPIFY_FETCH_TIMEOUT_MS}ms`);
+      }
       if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 1000));
     }
   }
@@ -482,6 +497,19 @@ const server = http.createServer(async (req, res) => {
       }
       if (!['SHOPIFY', ...MOCK_CHANNEL_CODES].includes(channel)) {
         return send(res, 400, { message: `Unknown channel: ${channel}` });
+      }
+      // Validate items: quantity must be an integer 1-9999; productId, when supplied, a positive integer
+      for (const item of items) {
+        const qty = Number(item?.quantity);
+        if (!Number.isInteger(qty) || qty < 1 || qty > 9999) {
+          return send(res, 400, { message: 'Invalid quantity: must be an integer between 1 and 9999' });
+        }
+        if (item.productId) {
+          const pid = Number(item.productId);
+          if (!Number.isInteger(pid) || pid < 1) {
+            return send(res, 400, { message: 'Invalid productId: must be a positive integer' });
+          }
+        }
       }
       try {
         const result = await placeChannelOrder({
@@ -1071,8 +1099,9 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
     console.error('[Server Error]', error);
     await logActivity('SERVER_ERROR', error.message, 'ERROR').catch(() => {});
+    const isDev = process.env.NODE_ENV !== 'production';
     return send(res, path.includes('/shopify/') ? 502 : 500, {
-      message: error.message,
+      message: isDev ? error.message : 'Internal server error',
       timestamp: new Date().toISOString(),
     });
   }
