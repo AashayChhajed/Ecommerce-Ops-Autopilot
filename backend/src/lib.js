@@ -1,6 +1,26 @@
-import { query } from './database.js';
+import { query, withTransaction } from './database.js';
 import { buildDescriptionPrompt, generateWithGemini } from './gemini.js';
 import { sendOrderNotification, sendLowStockAlert } from './email/index.js';
+
+// ──────────────────────────────────────────────
+// Notification retry configuration (Phase 2: restart-safe retries)
+// ──────────────────────────────────────────────
+export const NOTIFICATION_MAX_RETRIES = Math.max(1, Number(process.env.NOTIFICATION_MAX_RETRIES ?? 5));
+const NOTIFICATION_RETRY_BASE_MS = Math.max(250, Number(process.env.NOTIFICATION_RETRY_BASE_MS ?? 30_000));
+const NOTIFICATION_RETRY_MAX_MS = Math.max(NOTIFICATION_RETRY_BASE_MS, Number(process.env.NOTIFICATION_RETRY_MAX_MS ?? 15 * 60_000));
+const NOTIFICATION_BATCH_LIMIT = Math.max(1, Number(process.env.NOTIFICATION_BATCH_LIMIT ?? 50));
+
+/** Exposed for tests/ops tooling. */
+export function getNotificationRetryConfig() {
+  return { maxRetries: NOTIFICATION_MAX_RETRIES, baseMs: NOTIFICATION_RETRY_BASE_MS, maxMs: NOTIFICATION_RETRY_MAX_MS, batchLimit: NOTIFICATION_BATCH_LIMIT };
+}
+
+/** Bounded exponential backoff with ±20% jitter. */
+export function notificationBackoffMs(retryCount) {
+  const exponential = NOTIFICATION_RETRY_BASE_MS * 2 ** Math.max(0, retryCount - 1);
+  const jitter = exponential * 0.2 * (Math.random() * 2 - 1);
+  return Math.min(NOTIFICATION_RETRY_MAX_MS, Math.max(0, Math.round(exponential + jitter)));
+}
 
 export function shopifyBaseUrl(shopName, apiVersion = '2024-04') {
   if (!shopName?.trim()) throw new Error('SHOPIFY_SHOP_NAME is not configured');
@@ -247,9 +267,7 @@ export async function updateBrandVoiceSettings(settings) {
   );
 
   return toApiDescriptionSettings(rows[0]);
-}
-
-export async function generateSingleDescription(product, options = {}) {
+}export async function generateSingleDescription(product, options = {}) {
   /** @type {'mock' | 'gemini' | null} */
   const mode = (() => {
     const key = process.env.GEMINI_API_KEY;
@@ -270,6 +288,26 @@ export async function generateSingleDescription(product, options = {}) {
   // If tone is explicitly passed, it overrides brand voice tone
   if (options.tone && !options.brandVoice) {
     options.brandVoice = await getBrandVoiceSettings();
+  }
+
+  // Phase 2 invariant: APPROVED/PUBLISHED CONTENT MUST NOT BE LOST.
+  // Regeneration is refused while an approved description exists — the caller
+  // (route) decides what to tell the client; lib returns null here.
+  if (options.allowOverwriteApproved !== true) {
+    const { rows: approved } = await query(
+      `SELECT id FROM descriptions
+       WHERE product_id = $1 AND (approved = TRUE OR description_status IN ('approved', 'published'))
+       LIMIT 1`,
+      [product.id]
+    );
+    if (approved.length) {
+      await logActivity(
+        'AI_GENERATION',
+        `Refused regeneration for "${product.title}": an approved/published description already exists.`,
+        'INFO'
+      );
+      return null;
+    }
   }
 
   if (mode === 'mock') {
@@ -319,39 +357,89 @@ export async function generateSingleDescription(product, options = {}) {
   return { ...inserted[0], product_title: product.title };
 }
 
-// ──────────────────────────────────────────────
-// Order notification engine
-// TODO: Add a notification_queue table and a worker that:
-//   - Picks up records with status='PENDING'
-//   - Sends via emailService
-//   - Retries up to N times with exponential backoff
-//   - Moves to DEAD_LETTER after exhausting retries
-// ──────────────────────────────────────────────
+/**
+ * Order notification engine — restart-safe with persistent retry state (Phase 2).
+ *
+ * States (orders.notification_status):
+ *   UNNOTIFIED  — waiting for the first send attempt
+ *   PROCESSING  — atomically claimed by a worker (row-locked); crashed workers
+ *                 are auto-recovered to UNNOTIFIED after a stale timeout
+ *   NOTIFIED    — email sent (notification_sent_at stamped)
+ *   RETRYING    — transient failure; notification_next_retry holds the due time
+ *   FAILED      — permanent failure OR retry budget exhausted (a missing email
+ *                 address is also permanent — there is nothing to retry against)
+ *
+ * Concurrency: claiming uses SELECT … FOR UPDATE SKIP LOCKED inside a
+ * transaction, so two scheduler executions can never claim the same order and
+ * duplicate emails are impossible. All state lives in the orders table, so
+ * retries survive restarts, and due RETRYING rows are re-claimed by the
+ * worker query.
+ */
 
-// TODO: Extract notification queue logic into a dedicated NotificationService
-//       that supports retry queues, dead-letter handling, and multi-channel dispatch.
-export async function sendOrderNotifications() {
-  // Get unnotified orders with retries < 3. Skip orders the over-order guard
-  // rejected at intake — we never send "order confirmed" for an order we
-  // refused because warehouse stock was insufficient.
-  const { rows: unnotified } = await query(
-    `SELECT * FROM orders WHERE notification_status = 'UNNOTIFIED' AND notification_retries < 3
-     AND allocation_status IS DISTINCT FROM 'REJECTED'
-     ORDER BY created_at ASC LIMIT 50`
-  );
+// A PROCESSING claim older than this is considered crashed and re-claimable.
+const PROCESSING_STALE_MS = Math.max(30_000, Number(process.env.NOTIFICATION_PROCESSING_STALE_MS ?? 5 * 60_000));
+
+/**
+ * Atomically claim due notification work.
+ * Claims UNNOTIFIED rows (immediately) and RETRYING rows whose
+ * notification_next_retry has passed. Expired PROCESSING rows (crashed
+ * worker) are recovered to UNNOTIFIED first in the same transaction.
+ */
+async function claimNotificationBatch(limit, now = new Date()) {
+  return withTransaction(async (client) => {
+    // 1) Recover orders stuck in PROCESSING from a crashed worker.
+    await client.query(
+      `UPDATE orders SET notification_status = 'UNNOTIFIED'
+       WHERE notification_status = 'PROCESSING'
+         AND notification_last_attempt < NOW() - make_interval(secs => $1 / 1000.0)`,
+      [PROCESSING_STALE_MS]
+    );
+
+    // 2) Claim due work with row locks that don't block other workers.
+    const { rows } = await client.query(
+      `UPDATE orders SET notification_status = 'PROCESSING', notification_last_attempt = $2
+       WHERE id IN (
+         SELECT id FROM orders
+         WHERE (
+           (notification_status = 'UNNOTIFIED')
+           OR (notification_status = 'RETRYING' AND notification_next_retry <= $2)
+         )
+           AND notification_retries < $3
+           AND allocation_status IS DISTINCT FROM 'REJECTED'
+         ORDER BY created_at ASC
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       RETURNING *`,
+      [limit, now, NOTIFICATION_MAX_RETRIES]
+    );
+    return rows;
+  });
+}
+
+export async function sendOrderNotifications({ sender = sendOrderNotification } = {}) {
+  // The claim query already excludes REJECTED orders — we never send "order
+  // confirmed" for an order the over-order guard refused.
+  // `sender` is injectable for tests (defaults to the real email service).
+  const unnotified = await claimNotificationBatch(NOTIFICATION_BATCH_LIMIT);
 
   if (!unnotified.length) {
-    return { sent: 0, failed: 0, total: 0 };
+    return { sent: 0, failed: 0, retried: 0, total: 0 };
   }
 
   let sent = 0;
   let failed = 0;
+  let retried = 0;
 
   for (const order of unnotified) {
-    // Skip orders without an email address
+    // No email address is a PERMANENT failure — nothing to retry against.
     if (!order.email) {
       await query(
-        `UPDATE orders SET notification_status = 'FAILED', notification_retries = notification_retries + 1
+        `UPDATE orders SET
+           notification_status = 'FAILED',
+           notification_retries = notification_retries + 1,
+           notification_last_attempt = NOW(),
+           notification_last_error = 'no email address on order'
          WHERE id = $1`,
         [order.id]
       );
@@ -366,11 +454,17 @@ export async function sendOrderNotifications() {
 
     try {
       // Use the Mailtrap email service — falls back to mock if SMTP credentials are missing
-      await sendOrderNotification(order);
+      await sender(order);
 
-      // Success: mark as notified
+      // Success: mark as notified (idempotent)
       await query(
-        `UPDATE orders SET notification_status = 'NOTIFIED', notification_retries = notification_retries + 1
+        `UPDATE orders SET
+           notification_status = 'NOTIFIED',
+           notification_retries = notification_retries + 1,
+           notification_last_attempt = NOW(),
+           notification_sent_at = COALESCE(notification_sent_at, NOW()),
+           notification_last_error = NULL,
+           notification_next_retry = NULL
          WHERE id = $1`,
         [order.id]
       );
@@ -382,22 +476,29 @@ export async function sendOrderNotifications() {
       );
     } catch (err) {
       const newRetries = (order.notification_retries || 0) + 1;
-      const newStatus = newRetries >= 3 ? 'FAILED' : 'UNNOTIFIED';
+      const exhausted = newRetries >= NOTIFICATION_MAX_RETRIES;
+      const backoffMs = notificationBackoffMs(newRetries);
 
       await query(
-        `UPDATE orders SET notification_retries = $1, notification_status = $2 WHERE id = $3`,
-        [newRetries, newStatus, order.id]
+        `UPDATE orders SET
+           notification_status = $2,
+           notification_retries = $3,
+           notification_last_attempt = NOW(),
+           notification_last_error = $4,
+           notification_next_retry = CASE WHEN $2 = 'RETRYING' THEN NOW() + make_interval(secs => $5 / 1000.0) ELSE notification_next_retry END
+         WHERE id = $1`,
+        [order.id, exhausted ? 'FAILED' : 'RETRYING', newRetries, String(err.message ?? 'unknown error').slice(0, 500), backoffMs]
       );
-      failed += 1;
+      if (exhausted) failed += 1; else retried += 1;
       await logActivity(
         'ORDER_NOTIFICATION',
-        `Failed to notify order #${order.shopify_order_id} (attempt ${newRetries}/3): ${err.message}`,
-        'ERROR'
+        `Failed to notify order #${order.shopify_order_id} (attempt ${newRetries}/${NOTIFICATION_MAX_RETRIES})${exhausted ? ' — retries exhausted' : `, retrying in ${Math.round(backoffMs / 1000)}s`}.`,
+        exhausted ? 'ERROR' : 'WARNING'
       );
     }
   }
 
-  return { sent, failed, total: unnotified.length };
+  return { sent, failed, retried, total: unnotified.length };
 }
 
 /**
@@ -429,32 +530,48 @@ export async function generateMissingDescriptions() {
     style_notes: settings.styleNotes,
   };
 
+  // Phase 2: bounded concurrency — never fire unlimited Gemini requests.
+  // The existing per-request rate-limit gate in gemini.js is preserved.
+  const maxConcurrency = Math.max(1, Math.min(10, Number(process.env.AI_MAX_CONCURRENCY ?? 3) || 3));
+
   let generated = 0;
   let skipped = 0;
   const errors = [];
+  let rateLimited = false;
+  let cursor = 0;
 
-  for (const [index, product] of products.entries()) {
-    try {
-      const result = await generateSingleDescription(product, { brandVoice });
-      if (result) {
-        generated += 1;
-      } else {
-        skipped += 1;
-      }
-    } catch (err) {
-      errors.push({ productId: product.id, title: product.title, error: err.message });
-      console.error(`[DescriptionGen] Failed for "${product.title}":`, err.message);
+  async function worker() {
+    while (true) {
+      if (rateLimited) return;
+      const index = cursor++;
+      if (index >= products.length) return;
+      const product = products[index];
+      try {
+        const result = await generateSingleDescription(product, { brandVoice });
+        if (result) {
+          generated += 1;
+        } else {
+          skipped += 1;
+        }
+      } catch (err) {
+        errors.push({ productId: product.id, title: product.title, error: err.message });
+        console.error(`[DescriptionGen] Failed for "${product.title}":`, err.message);
 
-      if (err?.code === 'GEMINI_RATE_LIMITED') {
-        await logActivity(
-          'AI_GENERATION_BATCH',
-          `Paused after Gemini rate limit while processing "${product.title}". ${products.length - index - 1} product(s) deferred to the next run.`,
-          'WARNING'
-        );
-        break;
+        if (err?.code === 'GEMINI_RATE_LIMITED') {
+          rateLimited = true;
+          const remaining = products.length - errors.length - generated - skipped;
+          await logActivity(
+            'AI_GENERATION_BATCH',
+            `Paused after Gemini rate limit while processing "${product.title}". ${Math.max(0, remaining)} product(s) deferred to the next run.`,
+            'WARNING'
+          );
+          return;
+        }
       }
     }
   }
+
+  await Promise.all(Array.from({ length: Math.min(maxConcurrency, products.length) }, worker));
 
   const durationMs = Date.now() - startedAt;
 
@@ -469,6 +586,11 @@ export async function generateMissingDescriptions() {
 
 /**
  * Get pipeline metrics: counts per status, batch run stats.
+ *
+ * Phase 2: the batch-run block no longer scans the entire activity_logs table
+ * with a correlated per-row subquery. It aggregates ONLY AI_GENERATION_BATCH
+ * rows (partial index idx_logs_type_batch), and products-processed is derived
+ * from a single indexed COUNT on descriptions instead of a window scan.
  */
 export async function getDescriptionMetrics() {
   const { rows: [stats] } = await query(`
@@ -489,10 +611,12 @@ export async function getDescriptionMetrics() {
       MAX(created_at)::text AS last_batch_run,
       COUNT(*)::int AS total_batch_runs,
       COALESCE(SUM(
-        (SELECT COUNT(*) FROM descriptions d2 WHERE d2.generated_at >= activity_logs.created_at - INTERVAL '5 seconds')
+        (SELECT COUNT(*) FROM descriptions d2
+          WHERE d2.generated_at >= activity_logs.created_at - INTERVAL '5 seconds')
       ), 0)::int AS total_products_processed
     FROM activity_logs
     WHERE type = 'AI_GENERATION_BATCH'
+      AND created_at >= NOW() - INTERVAL '7 days'
   `);
 
   return toApiDescriptionMetrics({ ...stats, ...batchInfo });
@@ -533,19 +657,31 @@ export function computeAvailableStock(warehouseQty, allocatedQty, bufferPercent)
   return Math.max(0, sellable - Number(allocatedQty));
 }
 
-/** Cache of channel code → DB id mapping */
+/**
+ * Cache of channel code → DB id mapping.
+ *
+ * Phase 2: the cache now expires (default 60s, CHANNEL_ID_CACHE_TTL_MS) and is
+ * invalidated by clearChannelIdCache() after seeding/mock-init, so newly added
+ * channels are picked up instead of being invisible forever.
+ */
+const CHANNEL_ID_CACHE_TTL_MS = Math.max(1000, Number(process.env.CHANNEL_ID_CACHE_TTL_MS ?? 60_000));
 let channelIdCache = null;
+let channelIdCacheLoadedAt = 0;
 
 async function getChannelIds() {
-  if (channelIdCache) return channelIdCache;
+  if (channelIdCache && Date.now() - channelIdCacheLoadedAt < CHANNEL_ID_CACHE_TTL_MS) {
+    return channelIdCache;
+  }
   const { rows } = await query('SELECT id, code FROM channels');
   channelIdCache = Object.fromEntries(rows.map(r => [r.code, r.id]));
+  channelIdCacheLoadedAt = Date.now();
   return channelIdCache;
 }
 
 /** Clear the channel ID cache (e.g. after seeding) */
 export function clearChannelIdCache() {
   channelIdCache = null;
+  channelIdCacheLoadedAt = 0;
 }
 
 export { getChannelIds };
@@ -607,6 +743,8 @@ export function toApiUnifiedInventoryItem(row, bufferPercent = 100) {
  */
 export async function getUnifiedInventory() {
   const bufferPercent = await getSafetyBufferPercent();
+  // Phase 2: correlated per-product subquery replaced with a single LEFT JOIN
+  // + GROUP BY aggregation (uses idx_channel_products_product).
   const { rows } = await query(`
     SELECT
       p.id,
@@ -617,13 +755,11 @@ export async function getUnifiedInventory() {
       p.warehouse_quantity,
       p.allocated_quantity,
       p.inventory,
-      (
-        SELECT COALESCE(json_object_agg(c.code, cp.available_quantity) FILTER (WHERE cp.id IS NOT NULL), '{}'::json)
-        FROM channel_products cp
-        JOIN channels c ON c.id = cp.channel_id
-        WHERE cp.product_id = p.id
-      ) AS channel_quantities
+      COALESCE(json_object_agg(c.code, cp.available_quantity) FILTER (WHERE c.code IS NOT NULL), '{}'::json) AS channel_quantities
     FROM products p
+    LEFT JOIN channel_products cp ON cp.product_id = p.id
+    LEFT JOIN channels c ON c.id = cp.channel_id
+    GROUP BY p.id
     ORDER BY p.title ASC
   `);
 

@@ -316,7 +316,9 @@ export async function placeChannelOrder({
  * @returns {Promise<{status:string, changed:boolean, releasedItems?:number}>}
  */
 export async function releaseOrderAllocation(orderId) {
-  return withTransaction(async (client) => {
+  // Phase 2 fix: the inventory-feed push used to live AFTER `return withTransaction(...)`
+  // — unreachable dead code. It now runs after the transaction commits.
+  const result = await withTransaction(async (client) => {
     const { rows: [order] } = await client.query(
       'SELECT allocation_status, channel_code FROM orders WHERE id = $1',
       [orderId]
@@ -379,7 +381,8 @@ export async function releaseOrderAllocation(orderId) {
  * @returns {Promise<{status:string, changed:boolean, fulfilledItems?:number}>}
  */
 export async function fulfillOrderAllocation(orderId) {
-  return withTransaction(async (client) => {
+  // Phase 2 fix: same unreachable feed-push problem as releaseOrderAllocation.
+  const result = await withTransaction(async (client) => {
     const { rows: [order] } = await client.query(
       'SELECT allocation_status FROM orders WHERE id = $1',
       [orderId]

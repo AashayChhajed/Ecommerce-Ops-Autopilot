@@ -4,7 +4,7 @@ process.env.AUTOPILOT_SKIP_START = '1';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { query, initializeDatabase, withTransaction } from '../src/database.js';
+import { query, initializeDatabase, closeDatabase, withTransaction } from '../src/database.js';
 import {
   placeChannelOrder,
   releaseOrderAllocation,
@@ -334,4 +334,5 @@ test('Over-Order Guard — transaction helper rolls back on error', async () => 
     }),
     /boom/
   );
+  await closeDatabase();
 });

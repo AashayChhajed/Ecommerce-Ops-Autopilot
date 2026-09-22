@@ -1,14 +1,43 @@
+import 'dotenv/config'; // loads .env from the working directory, if present
+import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import { dirname, resolve } from 'path';
 import pg from 'pg';
 
 const { Pool } = pg;
 
+// Load environment configuration BEFORE the pool captures it. The password
+// must come from environment configuration — there is NO hardcoded fallback.
+// dotenv never overrides variables that are already set (Render, CI, tests).
+const __dirname = dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: resolve(__dirname, '..', '.env') });       // backend/.env
+dotenv.config({ path: resolve(__dirname, '..', '..', '.env') }); // repo-root .env
+
+const connectionString = process.env.DATABASE_URL || undefined;
+
+// Fail clearly and safely when no password source is configured. Refusing to
+// construct the pool at import time means every entry point (server, worker,
+// tests) stops immediately with an actionable message instead of a cryptic
+// SCRAM auth error later.
+if (!connectionString && !process.env.PGPASSWORD) {
+  throw new Error(
+    '[DB] Missing database credentials: set DATABASE_URL (cloud) or PGPASSWORD (local) '
+    + 'in the environment — see backend/.env.example. Refusing to start without a password source.'
+  );
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  host: process.env.PGHOST ?? 'localhost',
-  port: Number(process.env.PGPORT ?? 5432),
-  database: process.env.PGDATABASE ?? 'ecommerce_ops_autopilot',
-  user: process.env.PGUSER ?? 'postgres',
-  password: process.env.PGPASSWORD ?? 'aashay',
+  // Cloud (DATABASE_URL) and local (PG* + PGPASSWORD) are mutually exclusive
+  // configs so the URL's embedded credentials can never be shadowed.
+  ...(connectionString
+    ? { connectionString }
+    : {
+        host: process.env.PGHOST ?? 'localhost',
+        port: Number(process.env.PGPORT ?? 5432),
+        database: process.env.PGDATABASE ?? 'ecommerce_ops_autopilot',
+        user: process.env.PGUSER ?? 'postgres',
+        password: process.env.PGPASSWORD,
+      }),
   // Cloud Postgres (Render, etc.) requires TLS. DATABASE_URL presence means
   // we're on a hosted database, so enable SSL with the standard
   // `rejectUnauthorized: false` pattern for Render-managed certificates.
@@ -101,6 +130,11 @@ export async function initializeDatabase() {
   const additions = [
     [`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notification_status TEXT NOT NULL DEFAULT 'UNNOTIFIED'`],
     [`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notification_retries INTEGER NOT NULL DEFAULT 0`],
+    // Phase 2: persistent, restart-safe notification retry state
+    [`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notification_last_attempt TIMESTAMPTZ`],
+    [`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notification_next_retry TIMESTAMPTZ`],
+    [`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notification_last_error TEXT`],
+    [`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notification_sent_at TIMESTAMPTZ`],
     [`ALTER TABLE scheduler_runs ADD COLUMN IF NOT EXISTS error_message TEXT`],
   ];
   for (const [sql] of additions) {
@@ -392,6 +426,17 @@ export async function initializeDatabase() {
     `CREATE INDEX IF NOT EXISTS idx_alerts_product_resolved ON inventory_alerts(product_id, resolved)`,
     `CREATE INDEX IF NOT EXISTS idx_logs_created ON activity_logs(created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_sched_job_started ON scheduler_runs(job_name, started DESC)`,
+    // Phase 2: pagination / filtering support
+    `CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_logs_type_created ON activity_logs(type, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_descriptions_status_generated ON descriptions(description_status, generated_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_descriptions_product_generated ON descriptions(product_id, generated_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON inventory_alerts(created_at DESC)`,
+    // Restart-safe notification retries: workers claim due orders by status + next retry time
+    `CREATE INDEX IF NOT EXISTS idx_orders_notify_due ON orders(notification_status, notification_next_retry)`,
+    // getDescriptionMetrics: batch stats no longer scan all of activity_logs
+    `CREATE INDEX IF NOT EXISTS idx_logs_type_batch ON activity_logs(type, created_at) WHERE type = 'AI_GENERATION_BATCH'`,
   ];
   for (const sql of indexes) {
     await pool.query(sql).catch(() => {});

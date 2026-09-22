@@ -23,6 +23,18 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22.14.0"
+      # Production runtime: unexpected errors are masked to a generic message
+      # (never raw internals) and the backend ENFORCES API-key auth at startup.
+      - key: NODE_ENV
+        value: "production"
+      # API authentication (X-API-Key header) for all admin/operational routes.
+      # REQUIRED: with NODE_ENV=production the backend REFUSES TO START when
+      # this is unset (fail closed), so production can never deploy open.
+      # Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+      # Set the value in the Render dashboard after the first deploy — never
+      # commit a real key to this file.
+      - key: AUTOPILOT_API_KEY
+        sync: false
       # Auto-wired to the free Postgres created above.
       - key: DATABASE_URL
         fromDatabase:

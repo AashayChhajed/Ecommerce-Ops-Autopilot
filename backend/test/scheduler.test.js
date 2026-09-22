@@ -2,7 +2,7 @@ process.env.AUTOPILOT_SKIP_START = '1';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { initializeDatabase, markOrphanedSchedulerRunsFailed, query } from '../src/database.js';
+import { initializeDatabase, markOrphanedSchedulerRunsFailed, closeDatabase, query } from '../src/database.js';
 
 test('startup recovery marks orphaned RUNNING scheduler rows as failed', async () => {
   await initializeDatabase();
@@ -27,4 +27,5 @@ test('startup recovery marks orphaned RUNNING scheduler rows as failed', async (
   assert.match(run.error_message, /startup recovery/i);
 
   await query('DELETE FROM scheduler_runs WHERE id = $1', [inserted[0].id]);
+  await closeDatabase();
 });

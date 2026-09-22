@@ -13,7 +13,8 @@ dotenv.config();
 import http from 'node:http';
 import { initializeDatabase, markOrphanedSchedulerRunsFailed, fetchMockChannelSeedData, query, closeDatabase } from './database.js';
 import {
-  productFromShopify, shopifyBaseUrl, toApiProduct,
+  productFromShopify,
+  toApiProduct,
   orderFromShopify, toApiOrder, toApiInventoryAlert,
   toApiActivityLog, toApiSchedulerRun, toApiDescription,
   toApiDescriptionSettings, toApiDescriptionMetrics,
@@ -26,9 +27,11 @@ import {
   updateWarehouseQuantity,
   updateChannelProductQuantity,
   syncMockChannel,
+  clearChannelIdCache,
 } from './lib.js';
 import { sendOrderNotification, sendLowStockAlert } from './email/index.js';
 import { startScheduler } from './scheduler.js';
+import { ShopifyFetchError } from './shopify.js';
 import {
   channelConnectors,
   MOCK_CHANNEL_CODES,
@@ -48,9 +51,11 @@ import {
   updateSafetyBufferPercent,
 } from './orderGuard.js';
 import { toApiOrderItem } from './lib.js';
+import { ApiError, ErrorCodes, send, sendError, parseBody, validateWith, paginationFromUrl, paginationMeta } from './http.js';
+import { authenticate, assertProductionAuth } from './auth.js';
+import * as schemas from './validation.js';
 
 const port = Number(process.env.PORT ?? 4000);
-const allowedOrigin = process.env.CORS_ORIGIN ?? 'http://localhost:3000';
 const shopifyToken = process.env.SHOPIFY_ACCESS_TOKEN;
 let shopifySyncCooldownUntil = 0;
 
@@ -71,63 +76,21 @@ function getShopifySyncCooldownRemainingMs() {
 }
 
 // ──────────────────────────────────────────────
-// Response helpers
+// Shopify fetcher — thin wrapper over the Phase 2 client (src/shopify.js)
 // ──────────────────────────────────────────────
-function send(res, status, body) {
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': allowedOrigin,
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-API-KEY',
-  });
-  res.end(JSON.stringify(body));
+function buildShopifyUrl(path) {
+  return `${shopifyBaseUrl(process.env.SHOPIFY_SHOP_NAME, process.env.SHOPIFY_API_VERSION)}${path}`;
 }
 
-function parseBody(req) {
-  return new Promise((resolve, reject) => {
-    let raw = '';
-    req.on('data', (chunk) => { raw += chunk; });
-    req.on('end', () => {
-      try { resolve(raw ? JSON.parse(raw) : {}); } catch { reject(new Error('Invalid JSON body')); }
-    });
-    req.on('error', reject);
-  });
+/** Fetch all pages of a Shopify collection using the Link-header cursor. */
+async function shopifyFetchAll(basePath, resource) {
+  return shopifyFetchAllImpl(buildShopifyUrl, basePath, resource);
 }
 
-// ──────────────────────────────────────────────
-// Shopify fetcher with retry
-// ──────────────────────────────────────────────
-const SHOPIFY_FETCH_TIMEOUT_MS = Number(process.env.SHOPIFY_FETCH_TIMEOUT_MS ?? 30000);
-
-async function shopifyFetch(path) {
-  if (!shopifyToken) throw new Error('SHOPIFY_ACCESS_TOKEN is not configured');
-  const url = `${shopifyBaseUrl(process.env.SHOPIFY_SHOP_NAME, process.env.SHOPIFY_API_VERSION)}${path}`;
-  let lastError;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), SHOPIFY_FETCH_TIMEOUT_MS);
-      try {
-        const response = await fetch(url, {
-          headers: { 'X-Shopify-Access-Token': shopifyToken },
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
-        if (!response.ok) throw new Error(`Shopify returned ${response.status} ${response.statusText}`);
-        return await response.json();
-      } finally {
-        clearTimeout(timeoutId);
-      }
-    } catch (error) {
-      lastError = error;
-      if (error.name === 'AbortError') {
-        lastError = new Error(`Shopify fetch timed out after ${SHOPIFY_FETCH_TIMEOUT_MS}ms`);
-      }
-      if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 1000));
-    }
-  }
-  throw new Error(`Shopify fetch failed after 3 attempts: ${lastError.message}`);
-}
+// shopifyBaseUrl still lives in lib.js (Phase 1 location).
+import { shopifyBaseUrl } from './lib.js';
+// Imported late so tests can stub the module cleanly.
+import { shopifyFetchAllPages as shopifyFetchAllImpl } from './shopify.js';
 
 // ──────────────────────────────────────────────
 // Core sync functions (exported for scheduler)
@@ -148,10 +111,11 @@ export async function syncProducts() {
     return { productsSynced: 0, skipped: true, reason: 'shopify_sync_cooldown' };
   }
 
-  const limit = Number(process.env.SHOPIFY_PRODUCT_LIMIT) || 250; // Shopify max is 250
-  let data;
+  const limit = Math.min(250, Math.max(1, Number(process.env.SHOPIFY_PAGE_LIMIT) || 250)); // Shopify max is 250
+  let products;
   try {
-    data = await shopifyFetch(`/products.json?limit=${limit}&status=active`);
+    products = (await shopifyFetchAll(`/products.json?limit=${limit}&status=active`, 'products'))
+      .map(productFromShopify);
   } catch (err) {
     const cooldownMs = getShopifySyncCooldownMs();
     setShopifySyncCooldown(cooldownMs);
@@ -163,8 +127,6 @@ export async function syncProducts() {
     return { productsSynced: 0, skipped: true, reason: err.message };
   }
 
-  const rawProducts = data.products ?? [];
-  const products = rawProducts.map(productFromShopify);
   const shopifyIds = products.map((p) => p.shopifyProductId);
 
   if (products.length) {
@@ -230,9 +192,10 @@ export async function syncOrders() {
     return { ordersSynced: 0, skipped: true, reason: 'shopify_sync_cooldown' };
   }
 
-  let data;
+  const limit = Math.min(250, Math.max(1, Number(process.env.SHOPIFY_PAGE_LIMIT) || 250));
+  let rawOrders;
   try {
-    data = await shopifyFetch('/orders.json?status=any&limit=250');
+    rawOrders = await shopifyFetchAll('/orders.json?status=any&limit=' + limit, 'orders');
   } catch (err) {
     const cooldownMs = getShopifySyncCooldownMs();
     setShopifySyncCooldown(cooldownMs);
@@ -244,7 +207,7 @@ export async function syncOrders() {
     return { ordersSynced: 0, skipped: true, reason: err.message };
   }
 
-  const orders = (data.orders ?? []).map(orderFromShopify);
+  const orders = rawOrders.map(orderFromShopify);
 
   if (orders.length) {
     const values = orders.map((_, i) => {
@@ -272,7 +235,6 @@ export async function syncOrders() {
     );
     if (newOrderMap.size > 0) {
       // Build product lookup: Shopify line items carry product_id and sku.
-      const rawOrders = data.orders ?? [];
       const byShopifyId = new Map();
       const bySku = new Map();
       for (const raw of rawOrders) {
@@ -297,6 +259,7 @@ export async function syncOrders() {
         for (const r of rows) if (!lookup[r.sku]) lookup[r.sku] = Number(r.id);
       }
 
+      // Partial-failure isolation: one broken order never aborts the rest.
       for (const raw of rawOrders) {
         const orderId = newOrderMap.get(Number(raw.id));
         if (!orderId) continue;
@@ -402,7 +365,7 @@ async function getKpis() {
       COUNT(*) FILTER (WHERE allocation_status = 'REJECTED')::int AS rejected_orders,
       (SELECT COALESCE(SUM(allocated_quantity), 0)::int FROM products) AS reserved_units
     FROM orders`),
-    query(`SELECT type, message, status, created_at FROM activity_logs ORDER BY created_at DESC LIMIT 5`),
+    query(`SELECT type, message, status, created_at FROM activity_logs ORDER BY created_at DESC, id DESC LIMIT 5`),
   ]);
 
   return {
@@ -427,7 +390,7 @@ async function getKpis() {
 // ──────────────────────────────────────────────
 // Router
 // ──────────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
+export const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return send(res, 204, {});
 
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -435,6 +398,11 @@ const server = http.createServer(async (req, res) => {
   const method = req.method;
 
   try {
+    // ── Authentication (Phase 2) ─────────────────
+    // Public: health probes + explicitly allowlisted read-only endpoints.
+    // Everything else — every mutation and admin action — requires X-API-Key.
+    authenticate(req, method, path);
+
     // ── Health ──────────────────────────────────
     if (method === 'GET' && (path === '/health' || path === '/actuator/health')) {
       await query('SELECT 1');
@@ -446,70 +414,65 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await getKpis());
     }
 
-    // ── Products ────────────────────────────────
+    // ── Products (paginated) ────────────────────
     if (method === 'GET' && (path === '/api/products' || path === '/api/shopify/products')) {
-      const search = url.searchParams.get('search') ?? '';
-      const status = url.searchParams.get('status') ?? '';
-      let sql = 'SELECT * FROM products';
+      const q = validateWith(schemas.productQuerySchema, Object.fromEntries(url.searchParams));
       const params = [];
       const conditions = [];
-      if (search) { params.push(`%${search}%`); conditions.push(`title ILIKE $${params.length}`); }
-      if (status) { params.push(status); conditions.push(`status = $${params.length}`); }
-      if (conditions.length) sql += ` WHERE ${conditions.join(' AND ')}`;
-      sql += ' ORDER BY updated_at DESC';
-      const { rows } = await query(sql, params);
-      return send(res, 200, rows.map(toApiProduct));
+      if (q.search) { params.push(`%${q.search}%`); conditions.push(`title ILIKE $${params.length}`); }
+      if (q.status) { params.push(q.status); conditions.push(`status = $${params.length}`); }
+      const whereSql = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+      const { rows: countRows } = await query(`SELECT COUNT(*)::int AS total FROM products${whereSql}`, params);
+      params.push(q.limit, (q.page - 1) * q.limit);
+      const { rows } = await query(
+        `SELECT * FROM products${whereSql} ORDER BY updated_at DESC, id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+        params
+      );
+      return send(res, 200, { data: rows.map(toApiProduct), pagination: paginationMeta(q.page, q.limit, countRows[0].total) });
     }
 
     const productMatch = path.match(/^\/api\/products\/(\d+)$/);
     if (method === 'GET' && productMatch) {
-      const { rows } = await query('SELECT * FROM products WHERE id = $1', [productMatch[1]]);
-      return rows.length ? send(res, 200, toApiProduct(rows[0])) : send(res, 404, { message: 'Product not found' });
+      const id = validateWith(schemas.idParamSchema, productMatch[1]);
+      const { rows } = await query('SELECT * FROM products WHERE id = $1', [id]);
+      return rows.length
+        ? send(res, 200, toApiProduct(rows[0]))
+        : sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Product not found'));
     }
 
-    // ── Orders ──────────────────────────────────
+    // ── Orders (paginated) ──────────────────────
     if (method === 'GET' && (path === '/api/orders' || path === '/api/shopify/orders')) {
-      const status = url.searchParams.get('status') ?? '';
-      let sql = `SELECT o.*, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id)::int AS item_count FROM orders o`;
+      const q = validateWith(schemas.orderQuerySchema, Object.fromEntries(url.searchParams));
       const params = [];
-      if (status) { params.push(status); sql += ` WHERE o.status = $1`; }
-      sql += ' ORDER BY o.created_at DESC';
-      const { rows } = await query(sql, params);
-      return send(res, 200, rows.map(toApiOrder));
+      let whereSql = '';
+      if (q.status) { params.push(q.status); whereSql = ` WHERE o.status = $1`; }
+      const { rows: countRows } = await query(`SELECT COUNT(*)::int AS total FROM orders o${whereSql}`, params);
+      if (q.status) { params.push(q.status); } // reuse the filter for the page query
+      params.push(q.limit, (q.page - 1) * q.limit);
+      const { rows } = await query(
+        `SELECT o.*, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id)::int AS item_count
+         FROM orders o${whereSql} ORDER BY o.created_at DESC, o.id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+        params
+      );
+      return send(res, 200, { data: rows.map(toApiOrder), pagination: paginationMeta(q.page, q.limit, countRows[0].total) });
     }
 
     // GET /api/orders/:id — single order detail (with line items)
     const orderDetailMatch = path.match(/^\/api\/orders\/(\d+)$/);
     if (method === 'GET' && orderDetailMatch) {
-      const { rows } = await query('SELECT * FROM orders WHERE id = $1', [orderDetailMatch[1]]);
-      if (!rows.length) return send(res, 404, { message: 'Order not found' });
+      const id = validateWith(schemas.idParamSchema, orderDetailMatch[1]);
+      const { rows } = await query('SELECT * FROM orders WHERE id = $1', [id]);
+      if (!rows.length) return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Order not found'));
       const items = await getOrderItems(rows[0].id);
       return send(res, 200, { ...toApiOrder(rows[0]), items: items.map(toApiOrderItem) });
     }
 
     // POST /api/orders/intake — ingest an order from any channel through the over-order guard
     if (method === 'POST' && path === '/api/orders/intake') {
-      const body = await parseBody(req);
-      const channel = String(body.channel ?? '').toUpperCase();
-      const items = Array.isArray(body.items) ? body.items : [];
-      if (!channel || !items.length) {
-        return send(res, 400, { message: 'channel and items are required' });
-      }
+      const body = validateWith(schemas.orderIntakeBodySchema, await parseBody(req));
+      const channel = body.channel.toUpperCase();
       if (!['SHOPIFY', ...MOCK_CHANNEL_CODES].includes(channel)) {
-        return send(res, 400, { message: `Unknown channel: ${channel}` });
-      }
-      // Validate items: quantity must be an integer 1-9999; productId, when supplied, a positive integer
-      for (const item of items) {
-        const qty = Number(item?.quantity);
-        if (!Number.isInteger(qty) || qty < 1 || qty > 9999) {
-          return send(res, 400, { message: 'Invalid quantity: must be an integer between 1 and 9999' });
-        }
-        if (item.productId) {
-          const pid = Number(item.productId);
-          if (!Number.isInteger(pid) || pid < 1) {
-            return send(res, 400, { message: 'Invalid productId: must be a positive integer' });
-          }
-        }
+        return sendError(res, new ApiError(ErrorCodes.VALIDATION_ERROR, 'Unknown channel'));
       }
       try {
         const result = await placeChannelOrder({
@@ -518,75 +481,80 @@ const server = http.createServer(async (req, res) => {
           customerName: body.customerName ?? null,
           email: body.email ?? null,
           status: body.status ?? 'paid',
-          total: Number(body.total ?? 0),
-          items,
+          total: body.total ?? 0,
+          items: body.items,
         });
         await logActivity(
           'ORDER_INTAKE',
           `Order #${result.orderId} via ${channel} → ${result.status}${result.shortfalls.length ? ` (${result.shortfalls.length} shortfall(s))` : ''}.`,
           result.status === 'ALLOCATED' ? 'SUCCESS' : 'WARNING'
         );
+        if (result.status === 'REJECTED') {
+          return send(res, 409, result);
+        }
         return send(res, 200, result);
       } catch (err) {
-        return send(res, 400, { message: err.message });
+        // Domain rejections (unresolvable line items etc.) are client errors,
+        // but never echo arbitrary request contents back.
+        return sendError(res, new ApiError(ErrorCodes.CONFLICT, 'Order could not be accepted', { cause: err }));
       }
     }
 
     // POST /api/orders/:id/release — cancel order and return reserved stock
     const orderReleaseMatch = path.match(/^\/api\/orders\/(\d+)\/release$/);
     if (method === 'POST' && orderReleaseMatch) {
-      const result = await releaseOrderAllocation(orderReleaseMatch[1]);
-      return send(res, result.status === 'NOT_FOUND' ? 404 : 200, result);
+      const id = validateWith(schemas.idParamSchema, orderReleaseMatch[1]);
+      const result = await releaseOrderAllocation(id);
+      if (result.status === 'NOT_FOUND') return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Order not found'));
+      return send(res, 200, result);
     }
 
     // POST /api/orders/:id/fulfill — ship order, deduct warehouse stock
     const orderFulfillMatch = path.match(/^\/api\/orders\/(\d+)\/fulfill$/);
     if (method === 'POST' && orderFulfillMatch) {
-      const result = await fulfillOrderAllocation(orderFulfillMatch[1]);
-      return send(res, result.status === 'NOT_FOUND' ? 404 : 200, result);
+      const id = validateWith(schemas.idParamSchema, orderFulfillMatch[1]);
+      const result = await fulfillOrderAllocation(id);
+      if (result.status === 'NOT_FOUND') return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Order not found'));
+      return send(res, 200, result);
     }
 
     // POST /api/orders/check — non-mutating availability check for a basket
     if (method === 'POST' && path === '/api/orders/check') {
-      const body = await parseBody(req);
-      const items = Array.isArray(body.items)
-        ? body.items
-            .map((i) => ({ productId: Number(i.productId), quantity: Number(i.quantity) || 1 }))
-            .filter((i) => Number.isFinite(i.productId))
-        : [];
-      if (!items.length) return send(res, 400, { message: 'items are required' });
-      const result = await checkOrderFulfillable(items);
+      const body = validateWith(schemas.orderCheckBodySchema, await parseBody(req));
+      const result = await checkOrderFulfillable(body.items);
       return send(res, 200, result);
     }
 
-    // ── Inventory ───────────────────────────────
+    // ── Inventory (paginated) ───────────────────
     if (method === 'GET' && (path === '/api/inventory' || path === '/api/shopify/inventory')) {
-      const lowStockOnly = url.searchParams.get('lowStockOnly') === 'true';
-      let sql = `
-        SELECT ia.*, p.title as product_title, p.shopify_product_id
+      // page/limit flow through the SAME paginationQuerySchema as every other
+      // collection (fractional/invalid values → 400, never a 500 from PG).
+      const q = validateWith(schemas.inventoryQuerySchema, Object.fromEntries(url.searchParams));
+      let baseSql = `
         FROM inventory_alerts ia
         JOIN products p ON p.id = ia.product_id
       `;
-      if (lowStockOnly) sql += ' WHERE ia.resolved = FALSE';
-      sql += ' ORDER BY ia.created_at DESC';
-      const { rows } = await query(sql);
-      return send(res, 200, rows.map(toApiInventoryAlert));
+      if (q.lowStockOnly) baseSql += ' WHERE ia.resolved = FALSE';
+      const { rows: countRows } = await query(`SELECT COUNT(*)::int AS total ${baseSql}`);
+      const { rows } = await query(
+        `SELECT ia.*, p.title as product_title, p.shopify_product_id ${baseSql}
+         ORDER BY ia.created_at DESC, ia.id DESC LIMIT $1 OFFSET $2`,
+        [q.limit, (q.page - 1) * q.limit]
+      );
+      return send(res, 200, { data: rows.map(toApiInventoryAlert), pagination: paginationMeta(q.page, q.limit, countRows[0].total) });
     }
 
     const thresholdMatch = path.match(/^\/api\/inventory\/threshold\/(\d+)$/);
     if (method === 'PUT' && thresholdMatch) {
-      const body = await parseBody(req);
-      const threshold = Number(body.threshold);
-      if (!Number.isFinite(threshold) || threshold < 0) {
-        return send(res, 400, { message: 'Invalid threshold value' });
-      }
+      const id = validateWith(schemas.idParamSchema, thresholdMatch[1]);
+      const body = validateWith(schemas.thresholdBodySchema, await parseBody(req));
       const { rows } = await query(
         'UPDATE inventory_alerts SET threshold = $1 WHERE id = $2 RETURNING *',
-        [threshold, thresholdMatch[1]]
+        [body.threshold, id]
       );
       return rows.length
         ? send(res, 200, toApiInventoryAlert(rows[0]))
-        : send(res, 404, { message: 'Alert not found' });
+        : sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Alert not found'));
     }
 
     // ── Order Notifications ─────────────────────
@@ -606,13 +574,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === 'POST' && path === '/api/descriptions/settings') {
-      const body = await parseBody(req);
-      const validTones = ['professional', 'friendly', 'playful', 'expert'];
-      if (body.tone && !validTones.includes(body.tone)) {
-        return send(res, 400, {
-          message: `Invalid tone "${body.tone}". Valid options: ${validTones.join(', ')}`,
-        });
-      }
+      const body = validateWith(schemas.descriptionSettingsBodySchema, await parseBody(req));
       const settings = await updateBrandVoiceSettings(body);
       return send(res, 200, settings);
     }
@@ -622,33 +584,42 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await getDescriptionMetrics());
     }
 
-    // List descriptions with status filter
+    // List descriptions with status filter (paginated)
     if (method === 'GET' && path === '/api/descriptions') {
-      const statusFilter = url.searchParams.get('status') ?? '';
-      const limit = Math.min(Number(url.searchParams.get('limit') ?? 200), 1000);
-      let sql = `
+      const q = validateWith(schemas.descriptionQuerySchema, Object.fromEntries(url.searchParams));
+      const params = [];
+      let whereSql = '';
+      if (q.status) {
+        params.push(q.status);
+        whereSql = ` WHERE d.description_status = $1`;
+      }
+      const { rows: countRows } = await query(
+        `SELECT COUNT(*)::int AS total FROM descriptions d JOIN products p ON p.id = d.product_id${whereSql}`,
+        params
+      );
+      params.push(q.limit, (q.page - 1) * q.limit);
+      const { rows } = await query(`
         SELECT d.*, p.title as product_title, p.vendor
         FROM descriptions d JOIN products p ON p.id = d.product_id
-      `;
-      const params = [];
-      if (statusFilter) {
-        params.push(statusFilter);
-        sql += ` WHERE d.description_status = $1`;
-      }
-      sql += ` ORDER BY d.generated_at DESC LIMIT ${limit}`;
-      const { rows } = await query(sql, params);
-      return send(res, 200, rows.map(toApiDescription));
+        ${whereSql}
+        ORDER BY d.generated_at DESC, d.id DESC
+        LIMIT $${params.length - 1} OFFSET $${params.length}
+      `, params);
+      return send(res, 200, { data: rows.map(toApiDescription), pagination: paginationMeta(q.page, q.limit, countRows[0].total) });
     }
 
-    // Legacy pending endpoint
+    // Legacy pending endpoint (paginated)
     if (method === 'GET' && path === '/api/descriptions/pending') {
+      const q = validateWith(schemas.paginationQuerySchema, Object.fromEntries(url.searchParams));
+      const { rows: countRows } = await query(`SELECT COUNT(*)::int AS total FROM descriptions WHERE approved = FALSE`);
       const { rows } = await query(`
         SELECT d.*, p.title as product_title, p.vendor
         FROM descriptions d JOIN products p ON p.id = d.product_id
         WHERE d.approved = FALSE
-        ORDER BY d.generated_at DESC
-      `);
-      return send(res, 200, rows.map(toApiDescription));
+        ORDER BY d.generated_at DESC, d.id DESC
+        LIMIT $1 OFFSET $2
+      `, [q.limit, (q.page - 1) * q.limit]);
+      return send(res, 200, { data: rows.map(toApiDescription), pagination: paginationMeta(q.page, q.limit, countRows[0].total) });
     }
 
     // Batch generation with enhanced metrics
@@ -662,19 +633,19 @@ const server = http.createServer(async (req, res) => {
     // GET /api/products/:id/description
     const productDescGetMatch = path.match(/^\/api\/products\/(\d+)\/description$/);
     if (method === 'GET' && productDescGetMatch) {
-      const productId = productDescGetMatch[1];
+      const productId = validateWith(schemas.idParamSchema, productDescGetMatch[1]);
       const { rows: productRows } = await query('SELECT * FROM products WHERE id = $1', [productId]);
-      if (!productRows.length) return send(res, 404, { message: 'Product not found' });
+      if (!productRows.length) return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Product not found'));
 
       const { rows: descRows } = await query(`
         SELECT d.*, p.title as product_title, p.vendor
         FROM descriptions d JOIN products p ON p.id = d.product_id
-        WHERE d.product_id = $1 ORDER BY d.generated_at DESC LIMIT 1
+        WHERE d.product_id = $1 ORDER BY d.generated_at DESC, d.id DESC LIMIT 1
       `, [productId]);
 
       if (!descRows.length) {
         return send(res, 200, {
-          productId: Number(productId),
+          productId,
           productTitle: productRows[0].title,
           hasDescription: false,
         });
@@ -685,18 +656,18 @@ const server = http.createServer(async (req, res) => {
     // POST /api/products/:id/description/approve
     const productDescApproveMatch = path.match(/^\/api\/products\/(\d+)\/description\/approve$/);
     if (method === 'POST' && productDescApproveMatch) {
-      const productId = productDescApproveMatch[1];
-      const body = await parseBody(req);
+      const productId = validateWith(schemas.idParamSchema, productDescApproveMatch[1]);
+      const body = validateWith(schemas.approveDescriptionBodySchema, await parseBody(req));
 
       const { rows: productRows } = await query('SELECT * FROM products WHERE id = $1', [productId]);
-      if (!productRows.length) return send(res, 404, { message: 'Product not found' });
+      if (!productRows.length) return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Product not found'));
 
       const { rows: descRows } = await query(`
-        SELECT * FROM descriptions WHERE product_id = $1 ORDER BY generated_at DESC LIMIT 1
+        SELECT * FROM descriptions WHERE product_id = $1 ORDER BY generated_at DESC, id DESC LIMIT 1
       `, [productId]);
 
       if (!descRows.length) {
-        return send(res, 404, { message: 'No generated description found for this product' });
+        return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'No generated description found for this product'));
       }
 
       const finalText = body.editedText || descRows[0].generated_description;
@@ -726,25 +697,25 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         status: 'APPROVED',
         descriptionId: Number(descRows[0].id),
-        productId: Number(productId),
+        productId,
         approvedAt: new Date().toISOString(),
       });
     }
 
-    // POST /api/products/:id/description/publish (placeholder)
+    // POST /api/products/:id/description/publish
     const productDescPublishMatch = path.match(/^\/api\/products\/(\d+)\/description\/publish$/);
     if (method === 'POST' && productDescPublishMatch) {
-      const productId = productDescPublishMatch[1];
+      const productId = validateWith(schemas.idParamSchema, productDescPublishMatch[1]);
 
       const { rows: productRows } = await query('SELECT * FROM products WHERE id = $1', [productId]);
-      if (!productRows.length) return send(res, 404, { message: 'Product not found' });
+      if (!productRows.length) return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Product not found'));
 
       const { rows: descRows } = await query(`
-        SELECT * FROM descriptions WHERE product_id = $1 AND description_status = 'approved' ORDER BY generated_at DESC LIMIT 1
+        SELECT * FROM descriptions WHERE product_id = $1 AND description_status = 'approved' ORDER BY generated_at DESC, id DESC LIMIT 1
       `, [productId]);
 
       if (!descRows.length) {
-        return send(res, 400, { message: 'No approved description to publish. Approve first.' });
+        return sendError(res, new ApiError(ErrorCodes.CONFLICT, 'No approved description to publish. Approve first.'));
       }
 
       // Placeholder: In the future, push to Shopify here
@@ -761,7 +732,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         status: 'PUBLISHED',
         descriptionId: Number(descRows[0].id),
-        productId: Number(productId),
+        productId,
         message: 'Description marked as published. Shopify push is a placeholder — implement later.',
         publishedAt: new Date().toISOString(),
       });
@@ -775,44 +746,43 @@ const server = http.createServer(async (req, res) => {
 
     const genMatch = productGenMatch || descGenerateMatch;
     if (method === 'POST' && genMatch) {
-      const productId = genMatch[1];
+      const productId = validateWith(schemas.idParamSchema, genMatch[1]);
       const { rows: productRows } = await query('SELECT * FROM products WHERE id = $1', [productId]);
-      if (!productRows.length) return send(res, 404, { message: 'Product not found' });
+      if (!productRows.length) return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Product not found'));
 
-      // Parse optional tone from request body
+      // Body is optional; when present it may carry a tone override.
       let tone;
       try {
-        const body = await parseBody(req);
+        const body = validateWith(schemas.generateDescriptionBodySchema, await parseBody(req));
         tone = body?.tone;
-      } catch {
-        // Body is optional — ignore parse errors
-      }
-
-      // Normalize: empty string means default (no tone)
-      if (tone === '') tone = undefined;
-
-      const validTones = ['professional', 'friendly', 'playful', 'expert'];
-      if (tone && !validTones.includes(tone)) {
-        return send(res, 400, {
-          message: `Invalid tone "${tone}". Valid options: ${validTones.join(', ')}`,
-        });
+      } catch (err) {
+        if (err instanceof ApiError && err.code !== ErrorCodes.VALIDATION_ERROR) throw err;
+        // validation errors on an optional empty body are re-thrown; empty object passes
+        throw err;
       }
 
       const desc = await generateSingleDescription(productRows[0], { tone });
-      if (!desc) return send(res, 200, { message: 'Description already exists' });
+      if (!desc) {
+        // Either an approved description already exists (Phase 2 protection) or
+        // a pending one could not be created (unique partial index).
+        return sendError(res, new ApiError(
+          ErrorCodes.CONFLICT,
+          'Description not regenerated: an approved/published description already exists for this product'
+        ));
+      }
       return send(res, 200, toApiDescription(desc));
     }
 
     const descApproveMatch = path.match(/^\/api\/descriptions\/approve\/(\d+)$/);
     if (method === 'POST' && descApproveMatch) {
-      const body = await parseBody(req);
-      const descId = descApproveMatch[1];
+      const body = validateWith(schemas.approveByIdBodySchema, await parseBody(req));
+      const descId = validateWith(schemas.idParamSchema, descApproveMatch[1]);
       const { rows: descRows } = await query('SELECT * FROM descriptions WHERE id = $1', [descId]);
-      if (!descRows.length) return send(res, 404, { message: 'Description not found' });
+      if (!descRows.length) return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Description not found'));
 
       const finalText = body.editedText || descRows[0].generated_description;
       await query(
-        `UPDATE descriptions SET approved = TRUE, generated_description = $1 WHERE id = $2`,
+        `UPDATE descriptions SET approved = TRUE, description_status = 'approved', generated_description = $1 WHERE id = $2`,
         [finalText, descId]
       );
       await query(
@@ -828,16 +798,19 @@ const server = http.createServer(async (req, res) => {
       const { rows } = await query(`
         SELECT DISTINCT ON (job_name) *
         FROM scheduler_runs
-        ORDER BY job_name, started DESC
+        ORDER BY job_name, started DESC, id DESC
       `);
       return send(res, 200, rows.map(toApiSchedulerRun));
     }
 
     if (method === 'GET' && path === '/api/scheduler/runs') {
-      const { rows } = await query(`
-        SELECT * FROM scheduler_runs ORDER BY started DESC LIMIT 50
-      `);
-      return send(res, 200, rows.map(toApiSchedulerRun));
+      const q = validateWith(schemas.paginationQuerySchema, Object.fromEntries(url.searchParams));
+      const { rows: countRows } = await query(`SELECT COUNT(*)::int AS total FROM scheduler_runs`);
+      const { rows } = await query(
+        `SELECT * FROM scheduler_runs ORDER BY started DESC, id DESC LIMIT $1 OFFSET $2`,
+        [q.limit, (q.page - 1) * q.limit]
+      );
+      return send(res, 200, { data: rows.map(toApiSchedulerRun), pagination: paginationMeta(q.page, q.limit, countRows[0].total) });
     }
 
     // ── Multi-Channel Inventory ──────────────────
@@ -858,11 +831,7 @@ const server = http.createServer(async (req, res) => {
     const mockChannelOrderMatch = path.match(/^\/api\/mock-channels\/(amazon_mock|myntra_mock|flipkart_mock)\/orders$/i);
     if (method === 'POST' && mockChannelOrderMatch) {
       const channelCode = mockChannelOrderMatch[1].toUpperCase();
-      const body = await parseBody(req);
-      const items = Array.isArray(body.items) ? body.items : [];
-      if (!items.length) {
-        return send(res, 400, { message: 'items are required' });
-      }
+      const body = validateWith(schemas.mockChannelOrderBodySchema, await parseBody(req));
       try {
         const result = await placeChannelOrder({
           channelCode,
@@ -870,8 +839,8 @@ const server = http.createServer(async (req, res) => {
           customerName: body.customerName ?? 'Test Shopper',
           email: body.email ?? null,
           status: body.status ?? 'paid',
-          total: Number(body.total ?? 0),
-          items,
+          total: body.total ?? 0,
+          items: body.items,
         });
         await logActivity(
           'ORDER_INTAKE',
@@ -880,7 +849,7 @@ const server = http.createServer(async (req, res) => {
         );
         return send(res, result.status === 'ALLOCATED' ? 200 : 409, result);
       } catch (err) {
-        return send(res, 400, { message: err.message });
+        return sendError(res, new ApiError(ErrorCodes.CONFLICT, 'Order could not be accepted', { cause: err }));
       }
     }
 
@@ -902,24 +871,17 @@ const server = http.createServer(async (req, res) => {
 
     // PUT /api/inventory/safety-buffer — update the over-order guard buffer
     if (method === 'PUT' && path === '/api/inventory/safety-buffer') {
-      const body = await parseBody(req);
-      const pct = Number(body.bufferPercent);
-      if (!Number.isFinite(pct) || pct < 1 || pct > 100) {
-        return send(res, 400, { message: 'bufferPercent must be between 1 and 100' });
-      }
-      return send(res, 200, await updateSafetyBufferPercent(pct));
+      const body = validateWith(schemas.safetyBufferBodySchema, await parseBody(req));
+      return send(res, 200, await updateSafetyBufferPercent(body.bufferPercent));
     }
 
     // POST /api/mock-channels/:channel/quantity — update mock channel qty by product ID
     const mockChannelQtyMatch = path.match(/^\/api\/mock-channels\/(amazon_mock|myntra_mock|flipkart_mock)\/quantity$/i);
     if (method === 'POST' && mockChannelQtyMatch) {
       const channelCode = mockChannelQtyMatch[1].toUpperCase();
-      const body = await parseBody(req);
-      const productId = Number(body.productId);
-      const qty = Number(body.quantity);
-      if (!productId || !Number.isFinite(qty)) {
-        return send(res, 400, { message: 'productId and quantity are required' });
-      }
+      const body = validateWith(schemas.mockQuantityBodySchema, await parseBody(req));
+      const productId = body.productId;
+      const qty = body.quantity;
 
       // 1) Try updating the in-memory mock store (may not have the product yet)
       const result = updateMockQuantityByProductId(channelCode, productId, qty);
@@ -947,14 +909,11 @@ const server = http.createServer(async (req, res) => {
               });
             }
             initializeMockData(seedData);
+            clearChannelIdCache();
           }
         } catch { /* ignore re-seed errors */ }
 
-        return send(res, 404, {
-          message: `Product #${productId} has no listing on ${channelCode}. Sync the channel first.`,
-          channel: channelCode,
-          productId,
-        });
+        return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, `Product #${productId} has no listing on ${channelCode}. Sync the channel first.`));
       }
 
       const updatedItem = result.success ? result.item : { availableQuantity: qty, channelSku: dbResult?.channelSku || '' };
@@ -967,7 +926,7 @@ const server = http.createServer(async (req, res) => {
       const channelCode = syncChannelMatch[1].toUpperCase().replace('-', '_');
       const connector = channelConnectors[channelCode];
       if (!connector) {
-        return send(res, 400, { message: `Unknown channel: ${channelCode}` });
+        return sendError(res, new ApiError(ErrorCodes.VALIDATION_ERROR, 'Unknown channel'));
       }
       const result = await syncMockChannel(channelCode, connector);
       return send(res, 200, {
@@ -998,33 +957,33 @@ const server = http.createServer(async (req, res) => {
     // POST /api/inventory/warehouse/:id — update warehouse quantity
     const warehouseMatch = path.match(/^\/api\/inventory\/warehouse\/(\d+)$/);
     if (method === 'POST' && warehouseMatch) {
-      const body = await parseBody(req);
-      const qty = Number(body.quantity);
-      if (!Number.isFinite(qty)) {
-        return send(res, 400, { message: 'quantity is required' });
-      }
-      const result = await updateWarehouseQuantity(warehouseMatch[1], qty);
+      const id = validateWith(schemas.idParamSchema, warehouseMatch[1]);
+      const body = validateWith(schemas.warehouseQuantityBodySchema, await parseBody(req));
+      const result = await updateWarehouseQuantity(id, body.quantity);
       if (!result) {
-        return send(res, 404, { message: 'Product not found' });
+        return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Product not found'));
       }
       return send(res, 200, result);
     }
 
-    // ── Activity Logs ────────────────────────────
+    // ── Activity Logs (paginated) ────────────────
     if (method === 'GET' && path === '/api/activity-logs') {
-      const type = url.searchParams.get('type') ?? '';
-      const limit = Math.min(Number(url.searchParams.get('limit') ?? 100), 500);
-      let sql = 'SELECT * FROM activity_logs';
+      const q = validateWith(schemas.logQuerySchema, Object.fromEntries(url.searchParams));
       const params = [];
-      if (type) { params.push(type); sql += ` WHERE type = $1`; }
-      sql += ` ORDER BY created_at DESC LIMIT ${limit}`;
-      const { rows } = await query(sql, params);
-      return send(res, 200, rows.map(toApiActivityLog));
+      let whereSql = '';
+      if (q.type) { params.push(q.type); whereSql = ` WHERE type = $1`; }
+      const { rows: countRows } = await query(`SELECT COUNT(*)::int AS total FROM activity_logs${whereSql}`, params);
+      params.push(q.limit, (q.page - 1) * q.limit);
+      const { rows } = await query(
+        `SELECT * FROM activity_logs${whereSql} ORDER BY created_at DESC, id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+        params
+      );
+      return send(res, 200, { data: rows.map(toApiActivityLog), pagination: paginationMeta(q.page, q.limit, countRows[0].total) });
     }
 
     // ── Test Email Endpoints (Sandbox / Dev only) ──
     if (method === 'POST' && path === '/api/test-email/order') {
-      const body = await parseBody(req);
+      const body = validateWith(schemas.testEmailOrderBodySchema, await parseBody(req));
 
       // Build a mock order object from request or use defaults
       const mockOrder = {
@@ -1054,12 +1013,12 @@ const server = http.createServer(async (req, res) => {
           total: mockOrder.total,
         });
       } catch (err) {
-        return send(res, 500, { type: 'order', sent: false, error: err.message });
+        return sendError(res, new ApiError(ErrorCodes.EXTERNAL_SERVICE_ERROR, 'Email delivery failed', { cause: err }));
       }
     }
 
     if (method === 'POST' && path === '/api/test-email/low-stock') {
-      const body = await parseBody(req);
+      const body = validateWith(schemas.testEmailLowStockBodySchema, await parseBody(req));
 
       // Build a mock product / alert from request or use defaults
       const mockProduct = {
@@ -1090,20 +1049,23 @@ const server = http.createServer(async (req, res) => {
           threshold: mockThreshold,
         });
       } catch (err) {
-        return send(res, 500, { type: 'low-stock', sent: false, error: err.message });
+        return sendError(res, new ApiError(ErrorCodes.EXTERNAL_SERVICE_ERROR, 'Email delivery failed', { cause: err }));
       }
     }
 
     // ── 404 ──────────────────────────────────────
-    return send(res, 404, { message: 'Route not found', path });
+    return sendError(res, new ApiError(ErrorCodes.NOT_FOUND, 'Route not found'));
   } catch (error) {
+    if (error instanceof ApiError) {
+      return sendError(res, error);
+    }
+    // Map known external-service failures to the standardized code.
+    if (error instanceof ShopifyFetchError) {
+      return sendError(res, new ApiError(ErrorCodes.EXTERNAL_SERVICE_ERROR, 'Shopify request failed', { cause: error }));
+    }
     console.error('[Server Error]', error);
-    await logActivity('SERVER_ERROR', error.message, 'ERROR').catch(() => {});
-    const isDev = process.env.NODE_ENV !== 'production';
-    return send(res, path.includes('/shopify/') ? 502 : 500, {
-      message: isDev ? error.message : 'Internal server error',
-      timestamp: new Date().toISOString(),
-    });
+    await logActivity('SERVER_ERROR', String(error?.message ?? 'unknown'), 'ERROR').catch(() => {});
+    return sendError(res, new ApiError(ErrorCodes.INTERNAL_ERROR, 'Internal server error', { cause: error }));
   }
 });
 
@@ -1111,6 +1073,10 @@ const server = http.createServer(async (req, res) => {
 // Bootstrap
 // ──────────────────────────────────────────────
 async function start() {
+  // FAIL CLOSED: never boot an unprotected API in production (Phase 2).
+  // Runs before any traffic is accepted; message contains no key material.
+  assertProductionAuth();
+
   await initializeDatabase();
   const recoveredRuns = await markOrphanedSchedulerRunsFailed();
   if (recoveredRuns > 0) {
@@ -1134,6 +1100,7 @@ async function start() {
         });
       }
       initializeMockData(seedData);
+      clearChannelIdCache();
       console.log(`[MockData] Initialized ${Object.keys(seedData).length} channel(s) with ${rows.length} total product records.`);
     } else {
       console.log('[MockData] No channel products found — skipping mock store seed');
