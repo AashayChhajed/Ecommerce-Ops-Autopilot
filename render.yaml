@@ -60,6 +60,17 @@ services:
         sync: false
       - key: SHOPIFY_API_VERSION
         value: "2024-04"
+      # ── Shopify webhooks (Phase 3) ──
+      #   HMAC signing secret for POST /api/webhooks/shopify. REQUIRED for the
+      #   receiver to accept deliveries (it fails closed when unset). Set the
+      #   value in the Render dashboard — never commit a real secret.
+      - key: SHOPIFY_WEBHOOK_SECRET
+        sync: false
+      #   Optional retry tuning (defaults shown in backend/.env.example):
+      # - key: WEBHOOK_MAX_RETRIES
+      # - key: WEBHOOK_RETRY_BASE_MS
+      # - key: WEBHOOK_RETRY_MAX_MS
+      # - key: WEBHOOK_MAX_EVENTS_PER_RUN
       # ── Email (Mailtrap sandbox; without creds the service runs in mock mode) ──
       - key: MAILTRAP_HOST
         sync: false

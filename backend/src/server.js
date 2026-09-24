@@ -13,9 +13,8 @@ dotenv.config();
 import http from 'node:http';
 import { initializeDatabase, markOrphanedSchedulerRunsFailed, fetchMockChannelSeedData, query, closeDatabase } from './database.js';
 import {
-  productFromShopify,
   toApiProduct,
-  orderFromShopify, toApiOrder, toApiInventoryAlert,
+  toApiOrder, toApiInventoryAlert,
   toApiActivityLog, toApiSchedulerRun, toApiDescription,
   toApiDescriptionSettings, toApiDescriptionMetrics,
   logActivity, auditInventory,
@@ -41,7 +40,6 @@ import {
 } from './channels/index.js';
 import {
   placeChannelOrder,
-  allocateOrderItems,
   releaseOrderAllocation,
   fulfillOrderAllocation,
   reconcileChannelListings,
@@ -51,9 +49,16 @@ import {
   updateSafetyBufferPercent,
 } from './orderGuard.js';
 import { toApiOrderItem } from './lib.js';
-import { ApiError, ErrorCodes, send, sendError, parseBody, validateWith, paginationFromUrl, paginationMeta } from './http.js';
+import { ApiError, ErrorCodes, send, sendError, parseBody, readRawBody, validateWith, paginationFromUrl, paginationMeta } from './http.js';
 import { authenticate, assertProductionAuth } from './auth.js';
 import * as schemas from './validation.js';
+// Phase 3: shared Shopify domain operations + webhook receiver.
+import {
+  upsertProductsFromShopify,
+  removeStaleShopifyProducts,
+  applyShopifyOrder,
+} from './shopifyDomain.js';
+import { receiveShopifyWebhook } from './webhooks.js';
 
 const port = Number(process.env.PORT ?? 4000);
 const shopifyToken = process.env.SHOPIFY_ACCESS_TOKEN;
@@ -112,10 +117,9 @@ export async function syncProducts() {
   }
 
   const limit = Math.min(250, Math.max(1, Number(process.env.SHOPIFY_PAGE_LIMIT) || 250)); // Shopify max is 250
-  let products;
+  let rawProducts;
   try {
-    products = (await shopifyFetchAll(`/products.json?limit=${limit}&status=active`, 'products'))
-      .map(productFromShopify);
+    rawProducts = await shopifyFetchAll(`/products.json?limit=${limit}&status=active`, 'products');
   } catch (err) {
     const cooldownMs = getShopifySyncCooldownMs();
     setShopifySyncCooldown(cooldownMs);
@@ -127,42 +131,13 @@ export async function syncProducts() {
     return { productsSynced: 0, skipped: true, reason: err.message };
   }
 
-  const shopifyIds = products.map((p) => p.shopifyProductId);
-
-  if (products.length) {
-    const values = products.map((_, i) => {
-      const b = i * 9 + 1;
-      return `($${b},$${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},NOW(),NOW())`;
-    });
-    const flat = products.flatMap((p) => [
-      p.shopifyProductId, p.title, p.description, p.vendor,
-      p.status, p.inventory, p.inventory, p.price, p.imageUrl,
-    ]);
-    await query(`
-      INSERT INTO products (shopify_product_id, title, description, vendor, status, inventory, warehouse_quantity, price, image_url, created_at, updated_at)
-      VALUES ${values.join(',')}
-      ON CONFLICT (shopify_product_id) DO UPDATE SET
-        title = EXCLUDED.title, description = EXCLUDED.description, vendor = EXCLUDED.vendor,
-        status = EXCLUDED.status, inventory = EXCLUDED.inventory,
-        warehouse_quantity = CASE
-          WHEN products.warehouse_quantity = 0 THEN EXCLUDED.inventory
-          ELSE products.warehouse_quantity
-        END,
-        price = EXCLUDED.price,
-        image_url = EXCLUDED.image_url,
-        updated_at = NOW()
-    `, flat);
-  }
+  // Shared domain operation — the SAME upsert webhook product events use.
+  const { upserted, shopifyIds } = await upsertProductsFromShopify(rawProducts);
 
   // Remove products no longer on Shopify
-  if (shopifyIds.length) {
-    const deleted = await query(
-      `DELETE FROM products WHERE shopify_product_id != ALL($1::bigint[])`,
-      [shopifyIds]
-    );
-    if (deleted.rowCount > 0) {
-      await logActivity('PRODUCT_CLEANUP', `Removed ${deleted.rowCount} stale product(s).`, 'INFO');
-    }
+  const { deleted } = await removeStaleShopifyProducts(shopifyIds);
+  if (deleted > 0) {
+    await logActivity('PRODUCT_CLEANUP', `Removed ${deleted} stale product(s).`, 'INFO');
   }
 
   // Resolve inventory alerts for products now above threshold
@@ -172,8 +147,8 @@ export async function syncProducts() {
     WHERE ia.product_id = p.id AND p.inventory > ia.threshold AND ia.resolved = FALSE
   `);
 
-  await logActivity('PRODUCT_SYNC', `Synchronized ${products.length} product(s) from Shopify.`, 'SUCCESS');
-  return { productsSynced: products.length };
+  await logActivity('PRODUCT_SYNC', `Synchronized ${rawProducts.length} product(s) from Shopify.`, 'SUCCESS');
+  return { productsSynced: upserted };
 }
 
 export async function syncOrders() {
@@ -207,88 +182,26 @@ export async function syncOrders() {
     return { ordersSynced: 0, skipped: true, reason: err.message };
   }
 
-  const orders = rawOrders.map(orderFromShopify);
-
-  if (orders.length) {
-    const values = orders.map((_, i) => {
-      const b = i * 6 + 1;
-      return `($${b},$${b+1},$${b+2},$${b+3},$${b+4},$${b+5})`;
-    });
-    const flat = orders.flatMap((o) => [
-      o.shopifyOrderId, o.customerName, o.email, o.status, o.total,
-      o.createdAt || new Date().toISOString(),
-    ]);
-    // RETURNING (xmax = 0) detects rows that were freshly INSERTed vs updated,
-    // so we only run the over-order guard for brand-new orders.
-    const { rows: upserted } = await query(`
-      INSERT INTO orders (shopify_order_id, customer_name, email, status, total, created_at)
-      VALUES ${values.join(',')}
-      ON CONFLICT (shopify_order_id) DO UPDATE SET
-        customer_name = EXCLUDED.customer_name, email = EXCLUDED.email,
-        status = EXCLUDED.status, total = EXCLUDED.total
-      RETURNING id, shopify_order_id, (xmax = 0) AS is_new
-    `, flat);
-
-    // ── Over-Order Guard for new Shopify orders ────────────────────────────
-    const newOrderMap = new Map(
-      upserted.filter((r) => r.is_new).map((r) => [Number(r.shopify_order_id), Number(r.id)])
-    );
-    if (newOrderMap.size > 0) {
-      // Build product lookup: Shopify line items carry product_id and sku.
-      const byShopifyId = new Map();
-      const bySku = new Map();
-      for (const raw of rawOrders) {
-        for (const li of raw.line_items ?? []) {
-          if (li.product_id) byShopifyId.set(Number(li.product_id), true);
-          if (li.sku) bySku.set(String(li.sku), true);
-        }
-      }
-      const lookup = {};
-      if (byShopifyId.size) {
-        const { rows } = await query(
-          `SELECT id, shopify_product_id FROM products WHERE shopify_product_id = ANY($1::bigint[])`,
-          [[...byShopifyId.keys()]]
+  // Shared domain operation — the SAME upsert + over-order guard path that
+  // webhook order events use, so polling and webhooks can never diverge.
+  for (const raw of rawOrders) {
+    try {
+      const result = await applyShopifyOrder(raw);
+      if (result.allocation) {
+        await logActivity(
+          'ORDER_ALLOCATION',
+          `Shopify order #${raw.id} ${result.allocation.status === 'ALLOCATED' ? 'accepted — warehouse stock reserved' : 'rejected at intake (insufficient warehouse stock)'}.`,
+          result.allocation.status === 'ALLOCATED' ? 'SUCCESS' : 'WARNING'
         );
-        for (const r of rows) lookup[r.shopify_product_id] = Number(r.id);
       }
-      if (bySku.size) {
-        const { rows } = await query(
-          `SELECT id, sku FROM products WHERE sku = ANY($1)`,
-          [[...bySku.keys()]]
-        );
-        for (const r of rows) if (!lookup[r.sku]) lookup[r.sku] = Number(r.id);
-      }
-
+    } catch (err) {
       // Partial-failure isolation: one broken order never aborts the rest.
-      for (const raw of rawOrders) {
-        const orderId = newOrderMap.get(Number(raw.id));
-        if (!orderId) continue;
-        const items = (raw.line_items ?? [])
-          .map((li) => {
-            const productId =
-              lookup[Number(li.product_id)] ?? lookup[String(li.sku)] ?? null;
-            return productId
-              ? { productId, quantity: Math.max(1, Number(li.quantity) || 1), channelSku: li.sku ?? null }
-              : null;
-          })
-          .filter(Boolean);
-        if (!items.length) continue;
-        try {
-          const result = await allocateOrderItems(orderId, items);
-          await logActivity(
-            'ORDER_ALLOCATION',
-            `Shopify order #${raw.id} ${result.status === 'ALLOCATED' ? 'accepted — warehouse stock reserved' : 'rejected at intake (insufficient warehouse stock)'}.`,
-            result.status === 'ALLOCATED' ? 'SUCCESS' : 'WARNING'
-          );
-        } catch (err) {
-          console.error(`[OrderGuard] Failed to allocate Shopify order #${raw.id}:`, err.message);
-        }
-      }
+      console.error(`[OrderSync] Failed to process Shopify order #${raw?.id}:`, err.message);
     }
   }
 
-  await logActivity('ORDER_SYNC', `Synchronized ${orders.length} order(s) from Shopify.`, 'SUCCESS');
-  return { ordersSynced: orders.length };
+  await logActivity('ORDER_SYNC', `Synchronized ${rawOrders.length} order(s) from Shopify.`, 'SUCCESS');
+  return { ordersSynced: rawOrders.length };
 }
 
 export async function fullSync() {
@@ -407,6 +320,23 @@ export const server = http.createServer(async (req, res) => {
     if (method === 'GET' && (path === '/health' || path === '/actuator/health')) {
       await query('SELECT 1');
       return send(res, 200, { status: 'UP', components: { db: { status: 'UP' } } });
+    }
+
+    // ── Shopify Webhooks (Phase 3) ───────────────
+    // Authenticated by Shopify's HMAC signature over the RAW body — NOT by
+    // X-API-Key (isProtected() classifies this path as public). The receiver
+    // fails closed: no secret ⇒ reject; bad/missing signature ⇒ reject.
+    // Shopify is acked as soon as the event is persisted; processing runs
+    // afterward (inline + the scheduled WebhookProcessingJob as a safety net).
+    if (method === 'POST' && path === '/api/webhooks/shopify') {
+      const rawBody = await readRawBody(req);
+      const result = await receiveShopifyWebhook({ rawBody, headers: req.headers });
+      return send(res, 200, {
+        received: true,
+        duplicate: result.duplicate,
+        eventId: result.eventId,
+        topic: result.topic,
+      });
     }
 
     // ── KPIs ────────────────────────────────────

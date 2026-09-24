@@ -144,6 +144,9 @@ export function assertProductionAuth() {
  *   GET  /api/products/:id, /api/products/:id/description, /api/orders/:id,
  *        /api/mock-channels/:channel/inventory — read-only detail views
  *   POST /api/orders/check                 — non-mutating availability lookup
+ *   POST /api/webhooks/shopify             — Shopify webhooks, authenticated by
+ *        Shopify HMAC over the raw body (NOT X-API-Key); the receiver fails
+ *        closed on a missing/invalid signature or an unconfigured secret
  *
  * PROTECTED (everything else — every mutation, admin action, and the
  * operationally/sensitive reads):
@@ -192,6 +195,14 @@ const PUBLIC_GET_PATTERNS = [
 // Non-mutating POST endpoint that stays open.
 const PUBLIC_POST_PATHS = new Set(['/api/orders/check']);
 
+// Shopify webhooks are deliberately OUTSIDE the X-API-Key scheme: Shopify
+// authenticates them with its own HMAC signature (verified by the webhook
+// receiver against the raw body). The receiver still FAILS CLOSED when the
+// signature is missing/invalid or SHOPIFY_WEBHOOK_SECRET is unset, so this is
+// not an unauthenticated endpoint — just a different authentication mechanism.
+// X-API-Key is never accepted as a substitute for the HMAC.
+const SHOPIFY_WEBHOOK_PATH = '/api/webhooks/shopify';
+
 /**
  * Decide whether a request needs authentication. Exported for tests and docs.
  * @param {string} method
@@ -204,6 +215,7 @@ export function isProtected(method, path) {
     return true;
   }
   if (method === 'POST' && PUBLIC_POST_PATHS.has(path)) return false;
+  if (method === 'POST' && path === SHOPIFY_WEBHOOK_PATH) return false;
   return true;
 }
 

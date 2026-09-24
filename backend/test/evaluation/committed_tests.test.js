@@ -274,6 +274,17 @@ test('Committed Test Set — Day 2 (Shopify Ops Autopilot)', { timeout: 30_000 }
     // parallel test files), we directly update our 20 test orders through the
     // same notification pipeline logic: mark each as NOTIFIED with retry count 1.
     // This tests the same DB-level invariant without cross-test contamination.
+    //
+    // Determinism: a parallel notifications test may legitimately have already
+    // claimed and notified these rows by the time this subtest runs, which would
+    // leave the UPDATE below with zero UNNOTIFIED candidates. Re-arm THIS suite's
+    // rows immediately before the pipeline step so the assertion exercises the
+    // transition instead of racing another worker.
+    await query(
+      `UPDATE orders SET notification_status = 'UNNOTIFIED', notification_retries = 0
+       WHERE shopify_order_id = ANY($1::bigint[])`,
+      [ALL_TEST_ORDER_IDS]
+    );
     const { rowCount } = await query(
       `UPDATE orders SET
          notification_status = 'NOTIFIED',

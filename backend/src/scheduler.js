@@ -1,5 +1,6 @@
 import cron from 'node-cron';
 import { query } from './database.js';
+import { processPendingWebhookEvents } from './webhooks.js';
 
 const runningJobs = new Set();
 
@@ -103,7 +104,15 @@ export function startScheduler({ fullSync, auditInventory, sendOrderNotification
     runJob('DescriptionGenerationJob', () => generateMissingDescriptions(), { logActivity });
   });
 
-  // ── Job 6: Log Cleanup — daily at 02:00 ─────────────────────────────────
+  // ── Job 6: Webhook Event Processing — every minute ──────────────────────
+  // Drains the persistent Shopify webhook queue (RECEIVED + due RETRYING).
+  // This is the reconciliation safety net for events whose inline processing
+  // was lost to a restart; claiming uses SKIP LOCKED so runs never overlap.
+  cron.schedule('* * * * *', () => {
+    runJob('WebhookProcessingJob', () => processPendingWebhookEvents(), { logActivity });
+  });
+
+  // ── Job 7: Log Cleanup — daily at 02:00 ─────────────────────────────────
   cron.schedule('0 2 * * *', () => {
     runJob('LogCleanupJob', async () => {
       const { rowCount } = await query(
@@ -113,5 +122,5 @@ export function startScheduler({ fullSync, auditInventory, sendOrderNotification
     }, { logActivity });
   });
 
-  console.log('[Scheduler] ✔ Jobs registered: ShopifySyncJob (hourly), InventoryAuditJob (hourly+30s), OrderNotificationJob (hourly+15s), ListingReconcileJob (hourly+45s), DescriptionGenerationJob (every 2h), LogCleanupJob (daily 02:00)');
+  console.log('[Scheduler] ✔ Jobs registered: ShopifySyncJob (hourly), InventoryAuditJob (hourly+30s), OrderNotificationJob (hourly+15s), ListingReconcileJob (hourly+45s), DescriptionGenerationJob (every 2h), WebhookProcessingJob (every minute), LogCleanupJob (daily 02:00)');
 }

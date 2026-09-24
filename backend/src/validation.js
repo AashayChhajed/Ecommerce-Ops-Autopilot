@@ -224,4 +224,45 @@ export const testEmailLowStockBodySchema = z
   })
   .strict();
 
+// ──────────────────────────────────────────────
+// Shopify webhooks (Phase 3)
+// ──────────────────────────────────────────────
+/**
+ * The Shopify topics the application actually maps to its domain model.
+ * Kept as a single source of truth so the receiver, the processor and the
+ * tests agree on what is supported.
+ */
+export const SUPPORTED_WEBHOOK_TOPICS = Object.freeze([
+  'orders/create',
+  'orders/updated',
+  'orders/cancelled',
+  'products/create',
+  'products/update',
+  'products/delete',
+  'inventory_levels/update',
+]);
+
+/**
+ * Required Shopify webhook headers (HMAC is checked separately, before this
+ * schema, so a bad signature yields 401 rather than a validation error).
+ * The header values are opaque strings here — format is validated by the
+ * receiver, not by Shopify's payload shape.
+ */
+export const webhookHeadersSchema = z
+  .object({
+    topic: z.string().trim().min(1, 'is required').max(100),
+    eventId: z.string().trim().min(1, 'is required').max(255),
+    shopDomain: z.string().trim().min(1, 'is required').max(255),
+  })
+  .strict();
+
+/**
+ * Minimal, forward-compatible envelope check for a webhook payload: it must be
+ * a JSON object (NOT an array or scalar). Unknown/additional Shopify fields are
+ * always tolerated (passthrough) so Shopify can add fields without breaking the
+ * receiver. Topic-specific shape is validated during processing (a permanent
+ * failure is retained, not retried).
+ */
+export const webhookPayloadSchema = z.object({}).passthrough();
+
 export { mockChannelEnum };

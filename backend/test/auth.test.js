@@ -81,6 +81,12 @@ test('isProtected classifies public vs protected endpoints correctly', () => {
   // Public: non-mutating availability check
   assert.equal(isProtected('POST', '/api/orders/check'), false);
 
+  // Public: Shopify webhooks use HMAC (not the API key). The route must NOT
+  // require X-API-Key, or Shopify's deliveries would be rejected at auth.
+  assert.equal(isProtected('POST', '/api/webhooks/shopify'), false);
+  // ...and no other method on that path is silently opened up.
+  assert.equal(isProtected('GET', '/api/webhooks/shopify'), true);
+
   // Protected: every mutation / admin action
   assert.equal(isProtected('POST', '/api/orders/intake'), true);
   assert.equal(isProtected('POST', '/api/shopify/sync'), true);

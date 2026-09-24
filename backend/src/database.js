@@ -238,6 +238,12 @@ export async function initializeDatabase() {
     `ALTER TABLE products ADD COLUMN IF NOT EXISTS warehouse_quantity INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE products ADD COLUMN IF NOT EXISTS sku TEXT`,
     `ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT`,
+    // Phase 3: map Shopify inventory items to a local product so
+    // inventory_levels/update webhooks can address the right row, and store
+    // Shopify's own resource timestamp so out-of-order deliveries converge
+    // instead of regressing newer data.
+    `ALTER TABLE products ADD COLUMN IF NOT EXISTS shopify_inventory_item_id BIGINT`,
+    `ALTER TABLE products ADD COLUMN IF NOT EXISTS shopify_updated_at TIMESTAMPTZ`,
   ];
   for (const sql of productAdditions) {
     await pool.query(sql).catch(() => {});
@@ -378,6 +384,8 @@ export async function initializeDatabase() {
     `ALTER TABLE orders ALTER COLUMN shopify_order_id DROP NOT NULL`,
     // Reserved (allocated) stock — the amount committed to accepted orders
     `ALTER TABLE products ADD COLUMN IF NOT EXISTS allocated_quantity INTEGER NOT NULL DEFAULT 0`,
+    // Phase 3: Shopify's own order timestamp for out-of-order webhook updates
+    `ALTER TABLE orders ADD COLUMN IF NOT EXISTS shopify_updated_at TIMESTAMPTZ`,
   ];
   for (const sql of orderAllocationAdditions) {
     await pool.query(sql).catch(() => {});
@@ -439,6 +447,43 @@ export async function initializeDatabase() {
     `CREATE INDEX IF NOT EXISTS idx_logs_type_batch ON activity_logs(type, created_at) WHERE type = 'AI_GENERATION_BATCH'`,
   ];
   for (const sql of indexes) {
+    await pool.query(sql).catch(() => {});
+  }
+
+  // ── Phase 3: Shopify webhook events (persistent, idempotent event queue) ──
+  // Receiving is separated from processing: Shopify is acked as soon as the
+  // event is persisted; a worker (inline or the scheduled job) drains the queue.
+  // event_id carries a UNIQUE constraint — that index IS the idempotency key
+  // and the source of truth for duplicate detection (no in-memory cache).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS webhook_events (
+      id BIGSERIAL PRIMARY KEY,
+      event_id TEXT NOT NULL UNIQUE,
+      topic TEXT NOT NULL,
+      shop_domain TEXT NOT NULL,
+      payload JSONB NOT NULL,
+      status TEXT NOT NULL DEFAULT 'RECEIVED',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      processed_at TIMESTAMPTZ,
+      next_attempt_at TIMESTAMPTZ,
+      last_attempt_at TIMESTAMPTZ,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // Supporting indexes: the worker claims due work by status + next_attempt_at
+  // and drains oldest-first by received_at. event_id is already indexed by its
+  // UNIQUE constraint, so no duplicate index is created for it.
+  const webhookIndexes = [
+    `CREATE INDEX IF NOT EXISTS idx_webhook_events_status ON webhook_events(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_webhook_events_next_attempt ON webhook_events(next_attempt_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_webhook_events_received ON webhook_events(received_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_webhook_events_due ON webhook_events(status, next_attempt_at)`,
+  ];
+  for (const sql of webhookIndexes) {
     await pool.query(sql).catch(() => {});
   }
 

@@ -215,13 +215,24 @@ test('Notification reliability — persistent retry state', { timeout: 60_000 },
        notification_last_error = NULL, notification_next_retry = NULL WHERE id = $1`,
       [orderId]
     );
-    let called = 0;
-    await sendOrderNotifications({ sender: async () => { called += 1; } });
+    // Phase 2 isolation (same pattern as the REJECTED subtest): the global
+    // worker claims EVERY due order, including ones owned by parallel test
+    // files, so counting all sender invocations is not isolated. Track only
+    // the invariants under test: our order, and any order lacking a recipient.
+    let calledForTarget = 0;
+    let calledWithoutRecipient = 0;
+    await sendOrderNotifications({
+      sender: async (o) => {
+        if (Number(o.id) === orderId) calledForTarget += 1;
+        if (!o.email) calledWithoutRecipient += 1;
+      },
+    });
     const { rows: [order] } = await query('SELECT notification_status, notification_retries, notification_last_error FROM orders WHERE id = $1', [orderId]);
     assert.equal(order.notification_status, 'FAILED');
     assert.equal(order.notification_last_error, 'no email address on order');
     assert.equal(Number(order.notification_retries) >= 1, true, 'attempt recorded');
-    assert.equal(called, 0, 'sender never invoked without a recipient');
+    assert.equal(calledForTarget, 0, 'sender never invoked for the no-email order');
+    assert.equal(calledWithoutRecipient, 0, 'sender never invoked without a recipient');
   });
 
   await t.test('notificationBackoffMs is bounded exponential with jitter', () => {

@@ -43,6 +43,12 @@ export function productFromShopify(product) {
     // Shopify product payloads carry the main image on `image.src` and the
     // full gallery under `images[].src` — capture whichever is available.
     imageUrl: product.image?.src ?? product.images?.[0]?.src ?? null,
+    // Phase 3: the first variant's inventory item lets inventory_levels/update
+    // webhooks address this product. Null when Shopify omits variants.
+    inventoryItemId: firstVariant?.inventory_item_id != null ? Number(firstVariant.inventory_item_id) : null,
+    // Shopify's own resource timestamp — used to ignore stale/out-of-order
+    // updates so an older webhook can never overwrite newer data.
+    shopifyUpdatedAt: product.updated_at ?? null,
   };
 }
 
@@ -72,6 +78,7 @@ export function orderFromShopify(shopifyOrder) {
     status: shopifyOrder.financial_status ?? 'pending',
     total: Number(shopifyOrder.total_price ?? 0),
     createdAt: shopifyOrder.created_at,
+    updatedAt: shopifyOrder.updated_at ?? null,
   };
 }
 
@@ -194,41 +201,80 @@ export async function logActivity(type, message, status = 'INFO') {
   }
 }
 
+/**
+ * Create an unresolved low-stock alert for a product if one does not already
+ * exist. Shared by the hourly inventory audit (polling) AND real-time webhook
+ * processing so both paths use the same dedup rule and neither can create a
+ * duplicate alert. Optionally emails the admin (best-effort).
+ *
+ * @param {{id:number|string, title:string, sku?:string|null, inventory:number|string}} product
+ * @param {{threshold?:number, notify?:boolean}} [opts]
+ * @returns {Promise<{created:boolean}>}
+ */
+export async function maybeCreateLowStockAlert(product, { threshold = 5, notify = true } = {}) {
+  const inventory = Number(product.inventory ?? 0);
+  if (!Number.isFinite(inventory) || inventory < 0 || inventory > threshold) {
+    return { created: false };
+  }
+  const { rows: existing } = await query(
+    'SELECT id FROM inventory_alerts WHERE product_id = $1 AND resolved = FALSE',
+    [product.id]
+  );
+  if (existing.length > 0) return { created: false };
+
+  await query(
+    'INSERT INTO inventory_alerts (product_id, current_stock, threshold) VALUES ($1, $2, $3)',
+    [product.id, inventory, threshold]
+  );
+  await logActivity(
+    'LOW_STOCK_ALERT',
+    `Low stock: "${product.title}" — ${inventory} remaining (threshold: ${threshold}).`,
+    'WARNING'
+  );
+
+  if (notify) {
+    try {
+      await sendLowStockAlert(product, inventory, threshold);
+      await logActivity(
+        'LOW_STOCK_EMAIL',
+        `Low-stock alert emailed for "${product.title}" (qty: ${inventory}).`,
+        'SUCCESS'
+      );
+    } catch (emailErr) {
+      // Non-blocking: never fail inventory handling because email failed.
+      console.error(`[LowStockAlert] Failed to send low-stock email for "${product.title}":`, emailErr.message);
+    }
+  }
+  return { created: true };
+}
+
+/**
+ * Resolve a product's unresolved alerts once its stock is back above the
+ * alert threshold. Mirrors the reconciliation the product sync performs.
+ * @param {number|string} productId
+ * @param {number|string} inventory
+ */
+export async function resolveProductInventoryAlert(productId, inventory) {
+  const { rowCount } = await query(`
+    UPDATE inventory_alerts ia SET resolved = TRUE
+    FROM products p
+    WHERE ia.product_id = p.id AND ia.product_id = $1
+      AND p.inventory > ia.threshold AND ia.resolved = FALSE
+  `, [productId]);
+  if (rowCount > 0) {
+    await logActivity('LOW_STOCK_RESOLVED', `Inventory alert resolved for product #${productId} (stock restored): ${inventory}.`, 'SUCCESS');
+  }
+  return { resolved: rowCount };
+}
+
 export async function auditInventory() {
   const { rows: lowStock } = await query(
     `SELECT id, title, sku, inventory FROM products WHERE inventory <= 5 AND inventory >= 0`
   );
   let alertsCreated = 0;
   for (const product of lowStock) {
-    const { rows: existing } = await query(
-      'SELECT id FROM inventory_alerts WHERE product_id = $1 AND resolved = FALSE',
-      [product.id]
-    );
-    if (existing.length === 0) {
-      await query(
-        'INSERT INTO inventory_alerts (product_id, current_stock, threshold) VALUES ($1, $2, 5)',
-        [product.id, product.inventory]
-      );
-      alertsCreated += 1;
-      await logActivity(
-        'LOW_STOCK_ALERT',
-        `Low stock: "${product.title}" — ${product.inventory} remaining (threshold: 5).`,
-        'WARNING'
-      );
-
-      // ── Send low-stock alert email via Mailtrap (best-effort) ──────────
-      try {
-        await sendLowStockAlert(product, product.inventory, 5);
-        await logActivity(
-          'LOW_STOCK_EMAIL',
-          `Low-stock alert emailed for "${product.title}" (qty: ${product.inventory}).`,
-          'SUCCESS'
-        );
-      } catch (emailErr) {
-        console.error(`[auditInventory] Failed to send low-stock email for "${product.title}":`, emailErr.message);
-        // Non-blocking: don't fail the audit because email failed
-      }
-    }
+    const { created } = await maybeCreateLowStockAlert(product);
+    if (created) alertsCreated += 1;
   }
   return { alertsCreated, lowStockCount: lowStock.length };
 }

@@ -186,6 +186,56 @@ export function parseBody(req) {
   });
 }
 
+/**
+ * Read the request body as RAW BYTES (Buffer) with a hard size cap.
+ *
+ * Used by the Shopify webhook receiver: HMAC verification must run against the
+ * exact bytes Shopify signed — re-serializing parsed JSON would change the byte
+ * sequence and break the signature. Parsing happens only AFTER verification.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} [maxBytes]
+ * @returns {Promise<Buffer>}
+ */
+export function readRawBody(req, maxBytes = MAX_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let received = 0;
+    let aborted = false;
+    const contentLengthHeader = req.headers['content-length'];
+    const contentLength = contentLengthHeader != null ? Number(contentLengthHeader) : null;
+
+    if (contentLength != null && Number.isFinite(contentLength) && contentLength > maxBytes) {
+      reject(new ApiError(ErrorCodes.VALIDATION_ERROR, `Request body too large (max ${Math.round(maxBytes / 1024)} KB)`));
+      return;
+    }
+
+    req.on('data', (chunk) => {
+      if (aborted) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      received += buf.length;
+      if (received > maxBytes) {
+        aborted = true;
+        reject(new ApiError(ErrorCodes.VALIDATION_ERROR, `Request body too large (max ${Math.round(maxBytes / 1024)} KB)`));
+        try { req.destroy(); } catch { /* socket already gone */ }
+        return;
+      }
+      chunks.push(buf);
+    });
+
+    req.on('end', () => {
+      if (aborted) return;
+      resolve(Buffer.concat(chunks));
+    });
+
+    req.on('error', () => {
+      if (aborted) return;
+      aborted = true;
+      reject(new ApiError(ErrorCodes.VALIDATION_ERROR, 'Could not read request body'));
+    });
+  });
+}
+
 // ──────────────────────────────────────────────
 // Validation
 // ──────────────────────────────────────────────
